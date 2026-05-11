@@ -64,8 +64,17 @@
 #define DEVICE_CORE_START     0x0001U /* 开始任务 */
 #define DEVICE_CORE_SHUTDOWN  0x0002U /* 关闭核心 */
 #define DEVICE_CORE_CHECK     0x0003U /* 检查消息 */
-#define DEVICE_SENSOR_DATA    0x0010U /* 传感器数据开始 */
+#define DEVICE_SENSOR_DATA    0x0010U /* 传感器数据(逐个,旧) */
+#define DEVICE_SENSOR_BATCH   0x0011U /* 传感器批量(合并优化) */
 #define SENSOR_PACKET_COUNT   10      /* 每次发送的传感器数据包数量 */
+
+/* 边缘异常检测阈值 */
+#define THR_VOLTAGE_MIN       210.0f  /* 电压下限(WARN) */
+#define THR_VOLTAGE_MAX       230.0f  /* 电压上限(WARN) */
+#define THR_CURRENT_MIN       0.5f    /* 电流下限(WARN) */
+#define THR_CURRENT_MAX       2.5f    /* 电流上限(WARN) */
+#define THR_TEMP_WARN         35.0f   /* 温度预警 */
+#define THR_TEMP_ERROR        50.0f   /* 温度异常 */
 
 /* External functions */
 extern int init_system();
@@ -112,6 +121,29 @@ static SensorPacket sensor_packets[SENSOR_PACKET_COUNT] = {
 static int sensor_data_send_count = 0;
 static struct rpmsg_endpoint *g_ept = NULL;
 static void *g_remoteproc_priv = NULL;
+static int g_edge_normal_count = 0;     /* 边缘过滤: NORMAL累计 */
+static int g_edge_alarm_count = 0;      /* 边缘过滤: 异常上报 */
+
+/* 边缘异常检测: 评估传感器数据，更新status字段，返回异常数 */
+static int edge_detect_anomaly(SensorPacket *pkts, int count)
+{
+    int alarms = 0;
+    for (int i = 0; i < count; i++) {
+        uint8_t old_status = pkts[i].status;
+        if (pkts[i].voltage < THR_VOLTAGE_MIN || pkts[i].voltage > THR_VOLTAGE_MAX ||
+            pkts[i].current < THR_CURRENT_MIN || pkts[i].current > THR_CURRENT_MAX ||
+            pkts[i].temperature > THR_TEMP_ERROR) {
+            pkts[i].status = 2; /* ERROR */
+        } else if (pkts[i].temperature > THR_TEMP_WARN ||
+                   pkts[i].voltage > 228.0f || pkts[i].voltage < 212.0f) {
+            pkts[i].status = 1; /* WARN */
+        }
+        if (pkts[i].status > 0) alarms++;
+    }
+    g_edge_alarm_count += alarms;
+    g_edge_normal_count += (count - alarms);
+    return alarms;
+}
 
 /************************** 资源表定义，与linux协商一致 **********/
 static struct remote_resource_table __resource resources __attribute__((used)) = {
@@ -225,44 +257,47 @@ int assemble_protocol_data(const ProtocolData* input, char* output, size_t* outp
     return 0; /* 组装成功 */
 }
 
-/* 发送单个传感器数据包到Linux */
-static int send_sensor_packet(struct rpmsg_endpoint *ept, SensorPacket *pkt)
+/* A1优化: 批量合并发送 — 10包合并为1次rpmsg_send, 减少10×中断 */
+static int send_batch_merged(struct rpmsg_endpoint *ept)
 {
+    int ret, alarms;
     ProtocolData tx_data;
-    int ret;
 
-    tx_data.command = DEVICE_SENSOR_DATA;
-    tx_data.length = sizeof(SensorPacket);
-    memcpy(tx_data.data, (char *)pkt, sizeof(SensorPacket));
-
-    ret = rpmsg_send(ept, &tx_data, 6 + sizeof(SensorPacket));
-    if (ret < 0) {
-        OPENAMP_DEVICE_ERROR("send sensor packet %d failed: %d\r\n", pkt->sensor_id, ret);
+    /* 更新时间戳 */
+    for (int i = 0; i < SENSOR_PACKET_COUNT; i++) {
+        sensor_packets[i].timestamp = sensor_data_send_count * 1000 + i * 100;
     }
+
+    /* C2优化: 边缘异常检测 */
+    alarms = edge_detect_anomaly(sensor_packets, SENSOR_PACKET_COUNT);
+
+    /* 批量合并: 10个SensorPacket一次性打包发送 */
+    tx_data.command = DEVICE_SENSOR_BATCH;
+    tx_data.length = sizeof(SensorPacket) * SENSOR_PACKET_COUNT;
+    memcpy(tx_data.data, (char *)sensor_packets, sizeof(SensorPacket) * SENSOR_PACKET_COUNT);
+
+    ret = rpmsg_send(ept, &tx_data, 6 + tx_data.length);
+    sensor_data_send_count++;
+
+    OPENAMP_DEVICE_INFO("FreeRTOS Batch: %d pkts merged, %d alarms, edge: %dN/%dA total\r\n",
+                        SENSOR_PACKET_COUNT, alarms, g_edge_normal_count, g_edge_alarm_count);
     return ret;
 }
 
-/* 发送全部10组传感器数据包 */
+/* 保留旧接口兼容性 */
+static int send_sensor_packet(struct rpmsg_endpoint *ept, SensorPacket *pkt)
+{
+    ProtocolData tx_data;
+    tx_data.command = DEVICE_SENSOR_DATA;
+    tx_data.length = sizeof(SensorPacket);
+    memcpy(tx_data.data, (char *)pkt, sizeof(SensorPacket));
+    return rpmsg_send(ept, &tx_data, 6 + sizeof(SensorPacket));
+}
+
+/* 旧函数名保留, 指向新实现 */
 static int send_all_sensor_packets(struct rpmsg_endpoint *ept)
 {
-    int i, ret;
-    int success_count = 0;
-
-    OPENAMP_DEVICE_INFO("FreeRTOS: Sending %d sensor packets to Linux...\r\n", SENSOR_PACKET_COUNT);
-    for (i = 0; i < SENSOR_PACKET_COUNT; i++) {
-        sensor_packets[i].timestamp = sensor_data_send_count * 1000 + i * 100;
-        ret = send_sensor_packet(ept, &sensor_packets[i]);
-        if (ret >= 0) {
-            success_count++;
-        }
-        if (g_remoteproc_priv) {
-            platform_poll(g_remoteproc_priv);
-        }
-    }
-    sensor_data_send_count++;
-    OPENAMP_DEVICE_INFO("FreeRTOS: Sent %d/%d sensor packets successfully\r\n",
-                        success_count, SENSOR_PACKET_COUNT);
-    return success_count;
+    return send_batch_merged(ept);
 }
 
 /*-----------------------------------------------------------------------------*

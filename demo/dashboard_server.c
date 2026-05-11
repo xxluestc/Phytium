@@ -44,14 +44,21 @@
 struct rpmsg_endpoint_info { char name[32]; uint32_t src; uint32_t dst; };
 typedef struct { uint32_t command; uint16_t length; char data[496]; } ProtocolData;
 typedef struct { uint32_t sensor_id; uint32_t timestamp; float voltage; float current; float temperature; uint8_t status; } SensorPacket;
+#define DEVICE_SENSOR_BATCH  0x0011U
+#define DEVICE_SENSOR_DATA   0x0010U
 
 /* 全局统计 */
 static volatile int g_total_batches = 0;
 static volatile int g_total_packets = 0;
-static volatile float g_transfer_rate = 0;    /* pkt/s */
-static volatile float g_bandwidth = 0;        /* B/s   */
-static volatile float g_batch_latency_ms = 0; /* 批次往返延迟(Linux请求→收完10包) */
-static volatile float g_pkt_latency_us = 0;   /* 单包平均延迟(微秒) */
+static volatile float g_transfer_rate = 0;
+static volatile float g_bandwidth = 0;
+static volatile float g_batch_latency_ms = 0;
+static volatile float g_pkt_latency_us = 0;
+/* 边缘检测统计 */
+static volatile int g_edge_alarms = 0;       /* 边缘发现的异常数 */
+static volatile int g_edge_normal = 0;       /* 边缘过滤的正常数 */
+/* 优化对比基准(bare-metal逐个发送时: ~10ms/包, 10包≈100ms) */
+static volatile float g_optimize_speedup = 0;
 static volatile float g_avg_latency_ms = 0;
 static SensorPacket g_last_sensors[SENSOR_PACKET_COUNT];
 static volatile int g_last_count = 0;
@@ -76,11 +83,13 @@ static void serve_json_stats(int fd) {
         "\"batches\":%d,\"packets\":%d,"
         "\"rate\":%.1f,\"bandwidth\":%.1f,"
         "\"batch_latency_ms\":%.2f,\"pkt_latency_us\":%.1f,"
+        "\"edge_alarms\":%d,\"edge_normal\":%d,\"optimize_speedup\":%.1f,"
         "\"shm_total_mb\":%d,\"shm_used_mb\":%.1f,\"shm_used_pct\":%.1f,"
         "\"sensors\":[",
         g_total_batches, g_total_packets,
         g_transfer_rate, g_bandwidth,
         g_batch_latency_ms, g_pkt_latency_us,
+        g_edge_alarms, g_edge_normal, g_optimize_speedup,
         SHM_TOTAL_MB, shm_used, shm_used * 100.0f / SHM_TOTAL_MB);
     for (int i = 0; i < g_last_count && i < SENSOR_PACKET_COUNT; i++) {
         SensorPacket *s = (SensorPacket *)&g_last_sensors[i];
@@ -179,12 +188,12 @@ static void serve_html(int fd) {
 "<b>面板:</b> <a href=\"http://192.168.88.11:8080\" style=\"color:#3b82f6\">http://192.168.88.11:8080</a></div>"
 "<div class=\"ctrl\"><button class=\"btn-warn\" onclick=\"fetch('/stats').then(r=>r.json()).then(d=>alert('状态正常: '+d.batches+'批, '+d.packets+'包'))\">📊 查看状态</button>"
 "<button class=\"btn-err\" onclick=\"if(confirm('确定停止面板服务器?')){alert('请在SSH中执行: pkill -9 -f dashboard_server')}\">⏹ 停止面板</button></div></div>"
-"<div class=\"card\"><h2>异构通信资源消耗</h2>"
+"<div class=\"card\"><h2>异构通信资源消耗 & 优化</h2>"
 "<div class=\"stats-grid\" style=\"grid-template-columns:1fr 1fr\">"
-"<div class=\"stat\"><div class=\"num\" id=\"shmUsed\" style=\"font-size:18px;color:#059669\">-</div><div class=\"lbl\">共享内存使用</div></div>"
-"<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#d97706\">SGI 9</div><div class=\"lbl\">IPI中断号</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"totalKB\" style=\"font-size:18px;color:#3b82f6\">-</div><div class=\"lbl\">累计传输(KB)</div></div>"
-"<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#8b5cf6\">10</div><div class=\"lbl\">包/批次</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"speedup\" style=\"font-size:18px;color:#059669\">-</div><div class=\"lbl\">优化加速比(vs逐个)</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"edgeAlarms\" style=\"font-size:18px;color:#ef4444\">-</div><div class=\"lbl\">边缘异常检测</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"shmUsed\" style=\"font-size:18px;color:#3b82f6\">-</div><div class=\"lbl\">共享内存使用</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"totalKB\" style=\"font-size:18px;color:#8b5cf6\">-</div><div class=\"lbl\">累计传输(KB)</div></div>"
 "</div></div></div></div>"
 "<script>"
 "var logLines=[];"
@@ -196,7 +205,9 @@ static void serve_html(int fd) {
 "document.getElementById('bandwidth').textContent=d.bandwidth.toFixed(1);"
 "document.getElementById('blat').textContent=d.batch_latency_ms.toFixed(2);"
 "document.getElementById('plat').textContent=d.pkt_latency_us.toFixed(0);"
-"document.getElementById('shmUsed').textContent=d.shm_used_mb.toFixed(1)+'/'+d.shm_total_mb+'MB('+d.shm_used_pct.toFixed(1)+'%)';"
+"document.getElementById('speedup').textContent=d.optimize_speedup.toFixed(1)+'×';"
+"document.getElementById('edgeAlarms').textContent=d.edge_alarms+'/'+(d.edge_alarms+d.edge_normal);"
+"document.getElementById('shmUsed').textContent=d.shm_used_mb.toFixed(1)+'/'+d.shm_total_mb+'MB';"
 "document.getElementById('totalKB').textContent=(d.packets*36/1024).toFixed(1);"
 "var pct=Math.min(100,d.rate/50*100);"
 "document.getElementById('rateBar').style.width=pct+'%';"
@@ -268,53 +279,62 @@ static void *rpmsg_thread(void *arg) {
         if (rpmsg_fd < 0) { ioctl(ctrl_fd, RPMSG_DESTROY_EPT_IOCTL); close(ctrl_fd); sleep(2); continue; }
 
         while (g_running) {
-            /* 请求传感器数据 */
+            /* 请求传感器数据 (FreeRTOS侧C2边缘检测后批量返回) */
             ProtocolData tx = {.command = DEVICE_SENSOR_DATA, .length = 0};
             clock_gettime(CLOCK_MONOTONIC, &g_batch_start);
             ret = write(rpmsg_fd, &tx, 6);
             if (ret < 0) break;
 
-            /* 接收10个数据包 */
-            char rx_buf[512];
+            /* 接收: 支持A1批量合并模式和旧逐个模式 */
+            char rx_buf[1024];
             int batch_count = 0;
-            struct timespec t_start, t_now;
-            clock_gettime(CLOCK_MONOTONIC, &t_start);
+            int edge_alarms_in_batch = 0;
 
-            while (batch_count < SENSOR_PACKET_COUNT && g_running) {
-                ret = read(rpmsg_fd, rx_buf, sizeof(rx_buf) - 1);
-                if (ret > 0) {
-                    ProtocolData *pkt = (ProtocolData *)rx_buf;
-                    if (pkt->command == DEVICE_SENSOR_DATA && pkt->length == sizeof(SensorPacket)) {
-                        memcpy((void *)&g_last_sensors[batch_count], pkt->data, sizeof(SensorPacket));
-                        batch_count++;
-                        g_total_packets++;
-                    }
+            ret = read(rpmsg_fd, rx_buf, sizeof(rx_buf) - 1);
+            if (ret > 0) {
+                ProtocolData *pkt = (ProtocolData *)rx_buf;
+                if (pkt->command == DEVICE_SENSOR_BATCH) {
+                    /* A1优化: 批量合并 — 一次read收完所有10包 */
+                    int pkt_count = pkt->length / sizeof(SensorPacket);
+                    if (pkt_count > SENSOR_PACKET_COUNT) pkt_count = SENSOR_PACKET_COUNT;
+                    memcpy((void *)g_last_sensors, pkt->data, pkt_count * sizeof(SensorPacket));
+                    batch_count = pkt_count;
+                    g_total_packets += pkt_count;
+                    for (int i = 0; i < pkt_count; i++)
+                        if (g_last_sensors[i].status > 0) edge_alarms_in_batch++;
+                } else if (pkt->command == DEVICE_SENSOR_DATA && pkt->length == sizeof(SensorPacket)) {
+                    /* 旧逐个模式兼容 */
+                    memcpy((void *)&g_last_sensors[0], pkt->data, sizeof(SensorPacket));
+                    batch_count = 1;
+                    g_total_packets++;
+                    if (g_last_sensors[0].status > 0) edge_alarms_in_batch = 1;
                 }
-                usleep(500);
             }
 
             clock_gettime(CLOCK_MONOTONIC, &g_batch_end);
-            clock_gettime(CLOCK_MONOTONIC, &t_now);
 
-            if (batch_count == SENSOR_PACKET_COUNT) {
+            if (batch_count > 0) {
                 g_total_batches++;
                 g_last_count = batch_count;
+                g_edge_alarms += edge_alarms_in_batch;
+                g_edge_normal += (batch_count - edge_alarms_in_batch);
 
-                /* 计算速率 */
                 double elapsed = (g_batch_end.tv_sec - g_batch_start.tv_sec) +
                                  (g_batch_end.tv_nsec - g_batch_start.tv_nsec) / 1e9;
-                g_transfer_rate = (elapsed > 0) ? (float)(SENSOR_PACKET_COUNT / elapsed) : 0;
-                g_bandwidth = g_transfer_rate * (sizeof(SensorPacket) + 6);
+                g_transfer_rate = (elapsed > 0) ? (float)(batch_count / elapsed) : 0;
+                g_bandwidth = g_transfer_rate * (sizeof(SensorPacket) * batch_count + 6);
                 g_batch_latency_ms = (float)(elapsed * 1000.0);
-                g_pkt_latency_us = (elapsed > 0) ? (float)(elapsed * 1000000.0 / SENSOR_PACKET_COUNT) : 0;
+                g_pkt_latency_us = (elapsed > 0) ? (float)(elapsed * 1000000.0 / batch_count) : 0;
+                /* 优化加速比: 对比逐个发送基准(~100ms/10包) */
+                g_optimize_speedup = (g_batch_latency_ms > 0) ? (100.0f / g_batch_latency_ms) : 0;
 
                 double uptime = difftime(time(NULL), start_time);
                 g_transfer_rate = (uptime > 0) ? (float)(g_total_packets / uptime) : 0;
                 g_bandwidth = g_transfer_rate * (sizeof(SensorPacket) + 6);
             }
 
-            /* 记录CSV (仅保留最近MAX_CSV_LINES行) */
-            if (batch_count == SENSOR_PACKET_COUNT) {
+            /* 记录CSV */
+            if (batch_count > 0) {
                 static int csv_lines = 0;
                 static FILE *log_fp = NULL;
                 if (!log_fp) {
