@@ -362,37 +362,87 @@ echo "=== dmesg last 5 ===" && dmesg | grep -iE "rproc|rpmsg" | tail -5
 | `Permission denied` | 设备权限 | `chmod 666 /dev/rpmsg*` |
 | `remoteproc can't stop` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
 
-## 9. 停止通信程序 (已验证)
+## 9. 通信程序操作指南 (已验证)
 
-### 完整停止流程
+### 启动流程 (完整序列, 已测试)
+
+主板重启后, 按以下顺序启动:
 
 ```bash
-# 步骤1: 停止面板服务器
-killall -9 dashboard_server
+# Step 1: 加载内核模块
+sudo modprobe rpmsg_char rpmsg_ctrl
 
-# 步骤2: 停止从核 (FreeRTOS)
+# Step 2: 启动从核 (FreeRTOS)
+echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
+sleep 2  # 等待从核启动
+
+# Step 3: 绑定 RPMsg 通道
+echo rpmsg_chrdev | sudo tee /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0/driver_override
+echo virtio0.rpmsg-openamp-demo-channel.-1.0 | sudo tee /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
+
+# Step 4: 设置设备权限
+sudo chmod 666 /dev/rpmsg0 /dev/rpmsg_ctrl0
+
+# Step 5: 启动监控面板
+nohup ~/dashboard_server > /tmp/dashboard.log 2>&1 &
+
+# Step 6 (可选): 启动生命周期管理器 (B1+B2+B3)
+nohup ~/lifecycle_mgr > /tmp/lifecycle.log 2>&1 &
+```
+
+### 验证通信正常
+
+```bash
+# 检查 rpmsg 设备数 (正常应为 2-5 个)
+ls /dev/rpmsg* | wc -l
+
+# 检查面板数据 (应为非零)
+curl -s http://localhost:8080/stats | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["batches"])'
+```
+
+### 停止流程 (完整序列)
+
+```bash
+# Step 1: 停止面板和生命周期管理器
+killall -9 dashboard_server lifecycle_mgr 2>/dev/null
+
+# Step 2: 停止从核
 echo stop | sudo tee /sys/class/remoteproc/remoteproc0/state
-# 确认: cat /sys/class/remoteproc/remoteproc0/state → offline
 
-# 步骤3: 卸载内核模块 (注意顺序: 先 ctrl 后 char)
+# Step 3: 卸载模块 (注意顺序)
 sudo rmmod rpmsg_ctrl
 sudo rmmod rpmsg_char
 
-# 步骤4: 验证清理完成
-ls /dev/rpmsg*             # 应无输出
-ls /sys/bus/rpmsg/devices/ # 应无输出或为空
+# Step 4: 验证清理
+ls /dev/rpmsg*          # 应无输出
 ```
 
-### 快速重启
+### 仅重启面板 (不重启从核)
+
+如果只是修改了面板代码, **不需要重启从核**, 只需要:
 
 ```bash
-echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
-sudo modprobe rpmsg_char rpmsg_ctrl
-echo rpmsg_chrdev | sudo tee /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0/driver_override
-echo virtio0.rpmsg-openamp-demo-channel.-1.0 | sudo tee /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
-sudo chmod 666 /dev/rpmsg0 /dev/rpmsg_ctrl0
+killall -9 dashboard_server
+# 复制新面板程序后:
 nohup ~/dashboard_server > /tmp/dashboard.log 2>&1 &
 ```
+
+### 重新部署固件后
+
+如果修改了 FreeRTOS/bare-metal 固件, **必须重启系统**:
+
+```bash
+scp new_firmware.elf user@192.168.88.11:/tmp/openamp_core0.elf
+ssh user@192.168.88.11 "sudo cp /tmp/openamp_core0.elf /lib/firmware/ && sudo reboot"
+```
+
+### 常见问题: /dev/rpmsg 设备数过多
+
+**现象**: `ls /dev/rpmsg* | wc -l` 超过 100, 面板数据显示 0 批次。
+
+**原因**: 多次启动 dashboard_server 或 lifecycle_mgr 而不清理, 每次创建新的 RPMsg 端点但不释放旧的。
+
+**解决**: `sudo reboot` 重启系统。**不要在短时间内反复启停面板程序。**
 
 ## 10. 优化记录
 
