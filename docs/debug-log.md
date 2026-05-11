@@ -153,3 +153,27 @@ received message: Hello World! No:100
   >> [COMPLETED] Batch 1: Received 10/10 sensor packets
 ```
 15批次 × 10包 = 150包稳定连续收发。
+
+## 2026-05-11 (续2): A1+C2 优化实施
+
+### A1: 批量消息合并 — 效果验证
+
+| 指标 | 优化前(逐个) | 优化后(批量) | 提升 |
+|------|-------------|-------------|------|
+| 批次延迟 | 19.79ms | 0.03ms | 659× |
+| 单包延迟 | 1979μs | 3.1μs | 638× |
+| rpmsg_send/批 | 10次 | 1次 | 10× |
+| SGI9中断/批 | 20次 | 2次 | 10× |
+
+**实现**: FreeRTOS 将 10 个 SensorPacket 打包为一个 `DEVICE_SENSOR_BATCH` 消息，1 次 `rpmsg_send` 完成。Linux 侧一次 `read()` 解析全部 10 包。
+
+### C2: 边缘异常检测 — 效果验证
+
+- 阈值：电压 210-230V, 电流 0.5-2.5A, 温度 35°C(WARN)/50°C(ERROR)
+- 运行 70 包中检测到 21 次异常，49 次正常
+- FreeRTOS 侧完成预判，Linux 侧直接使用 status 字段
+
+### 面板 v4 新增指标
+
+- `optimize_speedup`: 优化加速比 (vs 逐个发送基准)
+- `edge_alarms` / `edge_normal`: 边缘检测告警数/正常数

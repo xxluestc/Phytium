@@ -1,6 +1,6 @@
 # OpenAMP 异构多核通信流程详解
 
-> **当前状态**: 设备树已配置 → Bare-metal 通信已验证 → FreeRTOS 通信已验证 → 传感器10包批量数据收发正常
+> **当前状态**: 设备树已配置 → Bare-metal/FreeRTOS 双版本 → A1批量合并(659×) → C2边缘异常检测 → Web面板实时监控
 
 ## 1. 架构总览
 
@@ -360,4 +360,47 @@ echo "=== dmesg last 5 ===" && dmesg | grep -iE "rproc|rpmsg" | tail -5
 | state = running 但无通道 | FreeRTOS 固件崩溃 | 重启开发板重新加载固件 |
 | sensor只收1包 | `platform_poll` priv 指针错误 | FreeRTOS 需保存 remoteproc 结构体全局指针 |
 | `Permission denied` | 设备权限 | `chmod 666 /dev/rpmsg*` |
+| `remoteproc can't stop` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
+
+## 9. 停止通信程序 (已验证)
+
+### 完整停止流程
+
+```bash
+# 步骤1: 停止面板服务器
+killall -9 dashboard_server
+
+# 步骤2: 停止从核 (FreeRTOS)
+echo stop | sudo tee /sys/class/remoteproc/remoteproc0/state
+# 确认: cat /sys/class/remoteproc/remoteproc0/state → offline
+
+# 步骤3: 卸载内核模块 (注意顺序: 先 ctrl 后 char)
+sudo rmmod rpmsg_ctrl
+sudo rmmod rpmsg_char
+
+# 步骤4: 验证清理完成
+ls /dev/rpmsg*             # 应无输出
+ls /sys/bus/rpmsg/devices/ # 应无输出或为空
+```
+
+### 快速重启
+
+```bash
+echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
+sudo modprobe rpmsg_char rpmsg_ctrl
+echo rpmsg_chrdev | sudo tee /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0/driver_override
+echo virtio0.rpmsg-openamp-demo-channel.-1.0 | sudo tee /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
+sudo chmod 666 /dev/rpmsg0 /dev/rpmsg_ctrl0
+nohup ~/dashboard_server > /tmp/dashboard.log 2>&1 &
+```
+
+## 10. 优化记录
+
+详见 [optimization-record.md](optimization-record.md)
+
+| 优化 | 效果 |
+|------|------|
+| A1 批量合并 | 延迟 19.79ms→0.03ms (659×) |
+| C2 边缘检测 | FreeRTOS 阈值预判, 21次告警/70包 |
+| C3 Web面板 | 实时监控面板 http://192.168.88.11:8080 |
 | `remoteproc can't stop rproc: -1` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
