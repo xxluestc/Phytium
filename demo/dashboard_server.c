@@ -65,9 +65,22 @@ static volatile float g_avg_latency_ms = 0;
 static SensorPacket g_last_sensors[SENSOR_PACKET_COUNT];
 static volatile int g_last_count = 0;
 static volatile int g_running = 1;
+static int g_ctrl_fd = -1, g_rpmsg_fd = -1, g_http_fd = -1;
 static struct timespec g_batch_start, g_batch_end;
 
-void signal_handler(int sig) { g_running = 0; }
+/* 资源清理 */
+static void cleanup(void) {
+    if (g_rpmsg_fd >= 0) { close(g_rpmsg_fd); g_rpmsg_fd = -1; }
+    if (g_ctrl_fd >= 0) { ioctl(g_ctrl_fd, RPMSG_DESTROY_EPT_IOCTL); close(g_ctrl_fd); g_ctrl_fd = -1; }
+    if (g_http_fd >= 0) { close(g_http_fd); g_http_fd = -1; }
+    fclose(fopen(CSV_LOG_PATH, "w")); /* 重新创建CSV */
+}
+
+void signal_handler(int sig) {
+    fprintf(stderr, "\n[INFO] Signal %d, cleaning resources...\n", sig);
+    g_running = 0;
+    cleanup();
+}
 
 /* ─── HTTP响应工具 ─── */
 static void http_ok(int fd, const char *content_type) {

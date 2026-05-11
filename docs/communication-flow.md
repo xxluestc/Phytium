@@ -361,8 +361,29 @@ echo "=== dmesg last 5 ===" && dmesg | grep -iE "rproc|rpmsg" | tail -5
 | sensor只收1包 | `platform_poll` priv 指针错误 | FreeRTOS 需保存 remoteproc 结构体全局指针 |
 | `Permission denied` | 设备权限 | `chmod 666 /dev/rpmsg*` |
 | `remoteproc can't stop` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
+| 串口打印过多无法输入命令 | FreeRTOS 每批打印日志到UART1 | 已优化为每50批打印一次; 日常用SSH控制 |
+| `/dev/rpmsg` 设备过多(>100) | 多次启停面板未清理端点 | `sudo reboot`; 使用 `~/stop-openamp.sh` 正确停止 |
 
-## 9. 通信程序操作指南 (已验证)
+## 9. 通信程序操作 (一键启动/停止)
+
+### 一键启动
+
+在开发板上直接运行:
+```bash
+~/start-openamp.sh
+```
+
+### 一键停止
+
+```bash
+~/stop-openamp.sh
+```
+
+脚本自动处理: 模块加载/卸载、从核启停、通道绑定、面板启动、资源清理。
+
+### 手动操作 (备选)
+
+
 
 ### 启动流程 (完整序列, 已测试)
 
