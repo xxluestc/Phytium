@@ -1,24 +1,29 @@
 # OpenAMP 异构多核通信流程详解
 
+> **当前状态**: 设备树已配置 → Bare-metal 通信已验证 → FreeRTOS 通信已验证 → 传感器10包批量数据收发正常
+
 ## 1. 架构总览
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Phytium PE2204 SoC                            │
 │                                                                  │
+│  Linux主核 (CPU0-2, SMP)          FreeRTOS/bare-metal 从核       │
 │  ┌─────────────────────────┐    ┌─────────────────────────────┐ │
-│  │   Linux 主核 (Core 0-1)  │    │   裸机从核 (Core 3)         │ │
-│  │   FTC664 @ 1.8GHz       │    │   FTC310 @ 1.5GHz           │ │
-│  │                         │    │                             │ │
-│  │  rpmsg-demo-single      │    │  openamp_core0.elf          │ │
+│  │  CPU0: FTC310           │    │   CPU3: FTC664 (独占)       │ │
+│  │  CPU1: FTC310           │    │                             │ │
+│  │  CPU2: FTC664           │    │  RpmsgEchoTask (FreeRTOS)   │ │
+│  │                         │    │  或 main() (bare-metal)     │ │
+│  │  sensor_receiver        │    │       ↑                     │ │
+│  │       ↓                 │    │  RPMsg endpoint             │ │
+│  │  /dev/rpmsg_ctrl0       │    │       ↑                     │ │
+│  │  /dev/rpmsg0 (数据通道)  │    │  OpenAMP lib                │ │
 │  │       ↓                 │    │       ↑                     │ │
-│  │  /dev/rpmsg0 (ioctl)    │    │  RPMsg endpoint             │ │
+│  │  rpmsg_char.ko          │    │  virtio (vring)             │ │
 │  │       ↓                 │    │       ↑                     │ │
-│  │  rpmsg_char.ko          │    │  OpenAMP lib                │ │
+│  │  virtio_rpmsg_bus       │    │  libmetal                   │ │
 │  │       ↓                 │    │       ↑                     │ │
-│  │  virtio_rpmsg_bus       │    │  virtio (vring)             │ │
-│  │       ↓                 │    │       ↑                     │ │
-│  │  rproc-virtio           │    │  libmetal                   │ │
+│  │  rproc-virtio           │    │  FreeRTOS Kernel / 裸机     │ │
 │  │       ↓                 │    │       ↑                     │ │
 │  │  homo_remoteproc        │    │  PSCI CPU_ON                │ │
 │  └──────────┬──────────────┘    └──────────────┬──────────────┘ │
@@ -38,18 +43,35 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### CPU 分配
+
+| CPU | 核心 | MPIDR | 用途 |
+|-----|------|-------|------|
+| CPU0 | FTC310 | 0x200 | Linux SMP |
+| CPU1 | FTC310 | 0x201 | Linux SMP |
+| CPU2 | FTC664 | 0x000 | Linux SMP |
+| CPU3 | FTC664 | 0x100 | **从核 (OpenAMP 独占)** |
+
+### 从核操作系统
+
+| 类型 | SDK | 源文件 | 入口 |
+|------|-----|--------|------|
+| **FreeRTOS** (当前) | phytium-free-rtos-sdk | `rpmsg-echo_os.c` | `main()` → `xTaskCreate(RpmsgEchoTask)` → `vTaskStartScheduler()` |
+| Bare-metal | phytium-standalone-sdk | `slaver_00_example.c` | `main()` → `slave_init()` → `FRpmsgEchoApp()` |
+
 ## 2. 通信流程 (Linux → 从核 → Linux)
 
 ### 2.1 启动阶段
 
 ```
 Step 1: Linux 启动
-  └── 内核解析设备树 → 发现 homo_rproc 节点
+  └── 内核解析设备树 → 发现 homo_rproc@0 节点
       └── homo_remoteproc 驱动 probe
           ├── 解析 reserved-memory (0xB0100000, 409MB)
           ├── 映射共享内存为可执行 (PAGE_KERNEL_EXEC)
           ├── 注册 SGI 9 中断处理
           ├── 注册 CPU hotplug 回调
+          ├── homo_core_of_init() → 解析子节点 "homo,rproc-core"
           └── rproc_add() → /sys/class/remoteproc/remoteproc0
 
 Step 2: 用户启动从核
@@ -60,11 +82,15 @@ Step 2: 用户启动从核
       ├── 刷新 I/D-Cache
       └── PSCI CPU_ON → CPU3 从 0xB0100000 开始执行
 
-Step 3: 从核初始化
+Step 3: 从核初始化 (FreeRTOS)
   └── openamp_core0.elf 启动
-      ├── 初始化 libmetal (硬件抽象层)
-      ├── 初始化 OpenAMP (virtio, RPMsg)
-      ├── 创建 RPMsg 端点 "rpmsg-openamp-demo-channel"
+      ├── main() 入口
+      ├── rpmsg_echo_task() → xTaskCreate(RpmsgEchoTask, 8KB栈, 优先级4)
+      ├── vTaskStartScheduler() → FreeRTOS 调度器启动
+      ├── RpmsgEchoTask:
+      │   ├── device_init() - 初始化 libmetal + OpenAMP
+      │   ├── 创建 RPMsg 端点 "rpmsg-openamp-demo-channel"
+      │   └── FRpmsgEchoApp() - 主循环 platform_poll()
       └── 等待主核消息
 
 Step 4: RPMsg 通道建立
@@ -77,47 +103,90 @@ Step 5: 用户绑定驱动
   └── /dev/rpmsg0 创建
 ```
 
-### 2.2 数据发送 (Linux → 从核)
+### 2.2 传感器数据通信流程 (当前实现)
 
 ```
-Linux 用户程序                     内核                        从核 (Core 3)
-─────────────                     ────                        ────────────
-write(fd, "Hello", 6)
+Linux (sensor_receiver)               FreeRTOS从核 (RpmsgEchoTask)
+────────────────────────               ──────────────────────────
+1. ioctl(CREATE_EPT, "rpmsg-openamp-demo-channel")
+   在 /dev/rpmsg_ctrl0 创建端点
+                                       (等待消息...)
+2. write(DEVICE_SENSOR_DATA)  ────→   3. rpmsg_endpoint_cb()
+   发送传感器数据请求                      收到 DEVICE_SENSOR_DATA 命令
+                                           ↓
+                                      4. send_all_sensor_packets()
+                                         发送10组传感器数据:
+                                          Packet 1: ID=1, V=220.5, A=1.25, T=27.3
+                                          Packet 2: ID=2, V=221.0, A=1.30, T=28.1
+                                          ...
+                                          Packet 10: ID=10, V=221.2, A=1.32, T=35.2
+                                          (每组间隔 platform_poll 处理vring)
+5. read() ← 接收10个数据包
+   逐个解析 SensorPacket
+   打印: [PKT X] ID=X ts=X V=X A=X T=X [STATUS]
+                                          ↓
+6. 打印标志位:
+   [COMPLETED] Batch N: Received 10/10
+   [STATS] Total: N batches, N*10 packets
+                                          ↓
+7. sleep(2) → 下一批请求 ────────→     (等待下一批请求...)
+   重复步骤2-7 (持续运行)
+```
+
+### 2.3 基础回显通信流程 (rpmsg-demo-single)
+
+```
+Linux 用户程序                     内核                        从核
+─────────────                     ────                        ────
+write(fd, CHECK命令+数据)
   └── rpmsg_char.ko
       └── virtio_rpmsg_bus
           └── 将数据写入 vring0
-               (共享内存中的
-                virtqueue)
-              └── homo_rproc_kick()
-                  └── GICv3 SGI 9 → 从核
-                                        ──→ GIC 中断
-                                             └── IRQ handler
-                                                 └── rpmsg_recv()
-                                                     └── 处理 "Hello"
-                                                     └── rpmsg_send("Hello")
-                                                         └── 写入 vring1
-                                                         └── IPI → Linux
-  ←── GIC 中断
+              └── SGI 9 → 从核
+                                        ──→ rpmsg_recv()
+                                            └── 回显相同数据
+                                            └── rpmsg_send() → vring1
   ←── rproc_vq_interrupt()
   ←── virtio_rpmsg_bus
   ←── rpmsg_char.ko
-read(fd, buf, 512) ← "Hello"
+read(fd, buf) ← "Hello World! No:X"
 ```
 
-### 2.3 关键数据路径
+### 2.4 关键数据路径
 
 ```
-发送路径: 用户程序 → write() → /dev/rpmsg0 → rpmsg_char → virtio_rpmsg_bus
-          → vring (共享内存) → SGI 9 → 从核 → rpmsg_recv()
+发送: 用户程序 → write() → /dev/rpmsg0 → rpmsg_char → virtio_rpmsg_bus
+      → vring (共享内存) → SGI 9 → 从核 → rpmsg_recv()
 
-接收路径: 从核 → rpmsg_send() → vring (共享内存) → IPI → Linux
-          → rproc_vq_interrupt() → virtio_rpmsg_bus → rpmsg_char
-          → /dev/rpmsg0 → read() → 用户程序
+接收: 从核 → rpmsg_send() → vring (共享内存) → IPI → Linux
+      → rproc_vq_interrupt() → virtio_rpmsg_bus → rpmsg_char
+      → /dev/rpmsg0 → read() → 用户程序
 ```
 
 ## 3. 代码修改方法
 
-### 3.1 从核 (裸机) 代码
+### 3.1 FreeRTOS 从核代码 (当前使用)
+
+**位置**: `phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux/`
+
+```
+openamp_for_linux/
+├── main.c              ← FreeRTOS 入口 (创建任务, 启动调度器)
+├── src/
+│   └── rpmsg-echo_os.c ← ★ 通信逻辑 + 传感器数据发送
+├── common/             ← 共享头文件
+├── configs/            ← 平台配置文件
+│   └── pe2204_aarch64_phytiumpi_openamp_for_linux.config
+├── Kconfig             ← Kconfig (需FREERTOS_SDK_DIR)
+└── makefile            ← 构建配置
+```
+
+**修改从核逻辑** → 在 `rpmsg-echo_os.c` 中:
+- `rpmsg_endpoint_cb()` — 消息处理回调 (添加新命令)
+- `send_all_sensor_packets()` — 传感器数据批量发送
+- `RpmsgEchoTask()` — FreeRTOS 任务入口
+
+### 3.2 Bare-metal 从核代码
 
 **位置**: `phytium-standalone-sdk-master/example/system/amp/openamp_for_linux/`
 
@@ -125,53 +194,65 @@ read(fd, buf, 512) ← "Hello"
 openamp_for_linux/
 ├── main.c              ← 从核主入口
 ├── src/
-│   └── slaver_00_example.c  ← ★ 从核通信逻辑 (主要修改对象)
-├── common/             ← 共享头文件
+│   └── slaver_00_example.c  ← ★ 通信逻辑 (主要修改对象)
 ├── configs/            ← 平台配置文件
 └── makefile
 ```
 
-**修改从核逻辑** → 在 `slaver_00_example.c` 中修改消息处理回调
-
-### 3.2 主核 (Linux) 代码
+### 3.3 Linux 端代码
 
 **位置**: 项目 `demo/` 目录
 
-```
-demo/
-└── rpmsg-demo-single.c  ← Linux 主控程序
-```
+| 文件 | 用途 |
+|------|------|
+| `sensor_receiver.c` | 传感器数据批量接收 (当前) |
+| `rpmsg-demo-single.c` | 基础回显测试 |
 
-**修改 Linux 逻辑** → 参考 `rpmsg-demo-single.c` 编写新的数据处理程序
+**修改 Linux 逻辑** → 使用 `/dev/rpmsg_ctrl0` 创建端点，`/dev/rpmsg0` 收发数据。
 
 ## 4. 编译方法
 
-### 4.1 从核固件编译
+### 4.1 FreeRTOS 固件编译 (当前)
+
+**前置**: standalone SDK 必须复制到 `freertos-sdk/standalone/` 目录下。
 
 ```bash
-# 1. 设置工具链
+# 工具链
 export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
 
-# 2. 进入目录
-cd /home/alientek/Phytium_syscode/phytium-standalone-sdk-master/phytium-standalone-sdk-master/example/system/amp/openamp_for_linux
+# 进入目录
+cd /home/alientek/Phytium_syscode/phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux
 
-# 3. 配置 (首次或修改配置后需要)
+# 配置和编译
 make config_pe2204_phytiumpi_aarch64
-
-# 4. 编译
 make clean && make all
-
-# 5. 输出
-# → pe2204_aarch64_phytiumpi_openamp_core0.elf
+# 输出: pe2204_aarch64_phytiumpi_openamp_for_linux.elf
 ```
 
-### 4.2 Linux 程序编译
+**构建系统修复记录** (初次搭建需要):
+1. 复制 standalone SDK: `cp -r phytium-standalone-sdk-master/ freertos-sdk/standalone/`
+2. `Kconfig` 第22行: `source "$(SDK_DIR)/../freertos.kconfig"` → `source "$(FREERTOS_SDK_DIR)/freertos.kconfig"`
+3. `makefile` 第2行: 改为 `FREERTOS_SDK_DIR := $(abspath ...)` 并 `export`
+4. `tools/freertos_comonents.mk` 第2行: 改为 `$(abspath $(SDK_DIR)/..)`
+
+### 4.2 Bare-metal 固件编译
 
 ```bash
-# 使用 Linux 交叉编译器
+export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
+
+cd /home/alientek/Phytium_syscode/phytium-standalone-sdk-master/phytium-standalone-sdk-master/example/system/amp/openamp_for_linux
+
+make config_pe2204_phytiumpi_aarch64
+make clean && make all
+# 输出: pe2204_aarch64_phytiumpi_openamp_core0.elf
+```
+
+### 4.3 Linux 程序编译
+
+```bash
 export CROSS_COMPILE="/home/alientek/Phytium_syscode/GCC编译器/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-"
 
-${CROSS_COMPILE}gcc -Wall -O2 -o my_app my_app.c
+${CROSS_COMPILE}gcc -Wall -O2 -std=c11 -o sensor_receiver sensor_receiver.c
 ```
 
 ## 5. 部署和烧写
@@ -180,10 +261,13 @@ ${CROSS_COMPILE}gcc -Wall -O2 -o my_app my_app.c
 
 ```bash
 # 复制到开发板
-scp pe2204_aarch64_phytiumpi_openamp_core0.elf user@192.168.88.11:/tmp/openamp_core0.elf
+scp <firmware.elf> user@192.168.88.11:/tmp/openamp_core0.elf
 ssh user@192.168.88.11 "sudo cp /tmp/openamp_core0.elf /lib/firmware/"
 
-# 重启从核 (无需重启系统)
+# 方法1: 重启从核 (FreeRTOS 可能不响应stop, 推荐重启系统)
+ssh user@192.168.88.11 "sudo reboot"
+
+# 方法2: 如果从核支持stop (bare-metal)
 ssh user@192.168.88.11 "
   echo stop | sudo tee /sys/class/remoteproc/remoteproc0/state
   sleep 1
@@ -194,15 +278,15 @@ ssh user@192.168.88.11 "
 ### 5.2 Linux 程序部署
 
 ```bash
-scp my_app user@192.168.88.11:~/
-ssh user@192.168.88.11 "chmod +x ~/my_app"
+scp sensor_receiver user@192.168.88.11:~/
+ssh user@192.168.88.11 "chmod +x ~/sensor_receiver"
 ```
 
 ### 5.3 设备树修改 (需要时)
 
-设备树只有修改硬件资源时（如共享内存大小、中断号）才需要更新，修改上位机和从核程序代码**不需要更新设备树**。
+设备树只有修改硬件资源（共享内存大小、中断号等）才需要更新。修改应用层代码**不需要更新设备树**。
 
-如果确实需要修改设备树的流程见 `docs/setup-guide.md`。
+如果需要修改设备树，流程见 `docs/setup-guide.md`。
 
 ## 6. 验证方法
 
@@ -226,45 +310,54 @@ ssh user@192.168.88.11 "ls /sys/bus/rpmsg/devices/"
 ssh user@192.168.88.11 "dmesg | grep -iE 'rproc|rpmsg|virtio' | tail -20"
 ```
 
-### 6.4 运行测试程序
+### 6.4 运行传感器测试 (当前主测试)
 
 ```bash
-ssh user@192.168.88.11 "
+ssh -tt user@192.168.88.11 "
+  sudo modprobe rpmsg_char rpmsg_ctrl
+  echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
+  sleep 2
+  echo rpmsg_chrdev | sudo tee /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0/driver_override
+  echo virtio0.rpmsg-openamp-demo-channel.-1.0 | sudo tee /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
   sudo chmod 666 /dev/rpmsg0 /dev/rpmsg_ctrl0
-  ./my_app
+  timeout 30 ~/sensor_receiver
 "
 ```
 
 ### 6.5 快速验证脚本
 
 ```bash
-# 一键验证 OpenAMP 通信状态
 ssh user@192.168.88.11 '
-echo "=== remoteproc state: $(cat /sys/class/remoteproc/remoteproc0/state) ==="
+echo "=== remoteproc: $(cat /sys/class/remoteproc/remoteproc0/state) ==="
 echo "=== RPMsg channels ===" && ls /sys/bus/rpmsg/devices/ 2>/dev/null
 echo "=== /dev/rpmsg ===" && ls -la /dev/rpmsg* 2>/dev/null
 echo "=== dmesg last 5 ===" && dmesg | grep -iE "rproc|rpmsg" | tail -5
 '
 ```
 
-## 7. 当前通信通道配置
+## 7. 当前通信配置
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | 通道名 | `rpmsg-openamp-demo-channel` | 主核和从核必须一致 |
+| 从核 OS | FreeRTOS (RpmsgEchoTask, 8KB栈, 优先级4) | 也支持 bare-metal |
 | 从核地址 | `0` | RPMsg 目的地址 |
 | 主核地址 | `0xFFFFFFFF` (RPMSG_ADDR_ANY) | 自动分配 |
 | 共享内存基址 | `0xB0100000` | 物理地址 |
-| 共享内存大小 | `0x19900000` (409MB) | 含固件代码+vring+数据缓冲 |
+| 共享内存大小 | `0x19900000` (409MB) | 固件代码 + vring + 数据缓冲 |
 | IPI 中断 | SGI 9 | GICv3 软件生成中断 |
-| 从核 CPU | CPU 3 (FTC310) | MPIDR 0x201 |
+| 从核 CPU | CPU 3 (FTC664) | 由 Linux SMP 剥离 |
+| 传感器数据包 | 10包/批, 每2秒一批 | SensorPacket 结构体 (24字节) |
 
 ## 8. 故障排查
 
-| 现象 | 检查点 | 解决 |
-|------|--------|------|
-| state = offline | 固件文件不存在 | `ls /lib/firmware/openamp_core0.elf` |
-| state = crashed | 固件与内核不匹配 | 重新编译固件 |
-| 无 RPMsg 通道 | 从核未创建端点 | 检查从核代码通道名 |
-| /dev/rpmsg0 不存在 | 未绑定驱动 | 执行 bind 操作 |
-| write/read 失败 | 权限问题 | `chmod 666 /dev/rpmsg*` |
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `/sys/class/remoteproc/` 为空 | 设备树无 OpenAMP 节点 | 确认 dtb 包含嵌套结构 `homo,rproc` + `homo,rproc-core` |
+| `OF: reserved mem:` 未打印 | 未用启动 dtb 直接修改 | 不要用 overlay，直接修改 boot dtb |
+| `cpuhp setup state failed -16` | CPU hotplug 状态残留 | 重启开发板 |
+| probe 成功但无设备 | 用了平铺结构 (5.10) | kernel 6.6 需嵌套 `homo,rproc-core` 子节点 |
+| state = running 但无通道 | FreeRTOS 固件崩溃 | 重启开发板重新加载固件 |
+| sensor只收1包 | `platform_poll` priv 指针错误 | FreeRTOS 需保存 remoteproc 结构体全局指针 |
+| `Permission denied` | 设备权限 | `chmod 666 /dev/rpmsg*` |
+| `remoteproc can't stop rproc: -1` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
