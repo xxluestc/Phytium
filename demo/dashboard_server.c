@@ -1,6 +1,9 @@
 /*
  * Phytium Pi OpenAMP Real-time Dashboard Server
  * 嵌入式HTTP服务器 + RPMsg传感器数据采集 + Web可视化面板
+ * 运行: nohup ~/dashboard_server > /tmp/dashboard.log 2>&1 &
+ * 停止: pkill -9 -f dashboard_server
+ * 面板: http://192.168.88.11:8080
  */
 #define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -17,22 +20,38 @@
 #include <time.h>
 #include <pthread.h>
 
+/* ═══════════════════════════════════════════════════════════════
+ *  配置参数 (按需修改)
+ * ═══════════════════════════════════════════════════════════════ */
+#define DASHBOARD_PORT          8080
+#define CHANNEL_NAME            "rpmsg-openamp-demo-channel"
+#define DEVICE_SENSOR_DATA      0x0010U
+#define SENSOR_PACKET_COUNT     10          /* 每批传感器数据包数 */
+#define BATCH_INTERVAL_SEC      2           /* 批次间隔(秒) */
+#define MAX_LOG_LINES           30          /* 面板日志行数 */
+#define MAX_CSV_LINES           100         /* CSV文件最大行数(超出滚动) */
+#define CSV_LOG_PATH            "/tmp/dashboard_data.csv"
+#define FIRMWARE_SIZE_MB        1.2f        /* openamp_core0.elf 大小 */
+#define VRING_SIZE_KB           256         /* 两个vring总大小 */
+#define SHM_TOTAL_MB            409         /* 共享内存总量 */
+#define RPMSG_BUFFER_KB         256         /* RPMsg缓冲区估算 */
+/* ═══════════════════════════════════════════════════════════════ */
+
 #define RPMSG_ADDR_ANY 0xFFFFFFFF
 #define RPMSG_CREATE_EPT_IOCTL _IOW(0xb5, 0x1, struct rpmsg_endpoint_info)
 #define RPMSG_DESTROY_EPT_IOCTL _IO(0xb5, 0x2)
 
 struct rpmsg_endpoint_info { char name[32]; uint32_t src; uint32_t dst; };
-
 typedef struct { uint32_t command; uint16_t length; char data[496]; } ProtocolData;
 typedef struct { uint32_t sensor_id; uint32_t timestamp; float voltage; float current; float temperature; uint8_t status; } SensorPacket;
-#define DEVICE_SENSOR_DATA 0x0010U
-#define SENSOR_PACKET_COUNT 10
 
-/* 全局统计数据 (线程安全通过原子操作保护) */
+/* 全局统计 */
 static volatile int g_total_batches = 0;
 static volatile int g_total_packets = 0;
-static volatile float g_transfer_rate = 0;    /* packets/sec */
-static volatile float g_bandwidth = 0;        /* bytes/sec */
+static volatile float g_transfer_rate = 0;    /* pkt/s */
+static volatile float g_bandwidth = 0;        /* B/s   */
+static volatile float g_batch_latency_ms = 0; /* 批次往返延迟(Linux请求→收完10包) */
+static volatile float g_pkt_latency_us = 0;   /* 单包平均延迟(微秒) */
 static volatile float g_avg_latency_ms = 0;
 static SensorPacket g_last_sensors[SENSOR_PACKET_COUNT];
 static volatile int g_last_count = 0;
@@ -50,14 +69,19 @@ static void http_ok(int fd, const char *content_type) {
 
 /* ─── JSON API: /stats ─── */
 static void serve_json_stats(int fd) {
+    float shm_used = FIRMWARE_SIZE_MB + (VRING_SIZE_KB + RPMSG_BUFFER_KB) / 1024.0f;
     char buf[4096];
     int len = snprintf(buf, sizeof(buf),
         "{"
         "\"batches\":%d,\"packets\":%d,"
-        "\"rate\":%.1f,\"bandwidth\":%.1f,\"latency_ms\":%.2f,"
+        "\"rate\":%.1f,\"bandwidth\":%.1f,"
+        "\"batch_latency_ms\":%.2f,\"pkt_latency_us\":%.1f,"
+        "\"shm_total_mb\":%d,\"shm_used_mb\":%.1f,\"shm_used_pct\":%.1f,"
         "\"sensors\":[",
         g_total_batches, g_total_packets,
-        g_transfer_rate, g_bandwidth, g_avg_latency_ms);
+        g_transfer_rate, g_bandwidth,
+        g_batch_latency_ms, g_pkt_latency_us,
+        SHM_TOTAL_MB, shm_used, shm_used * 100.0f / SHM_TOTAL_MB);
     for (int i = 0; i < g_last_count && i < SENSOR_PACKET_COUNT; i++) {
         SensorPacket *s = (SensorPacket *)&g_last_sensors[i];
         len += snprintf(buf + len, sizeof(buf) - len,
@@ -132,14 +156,16 @@ static void serve_html(int fd) {
 "</div>"
 "<div class=\"flow-text\">10组传感器模拟数据 → FreeRTOS采集 → RPMsg发送 → Linux接收处理 → 实时显示</div></div>"
 "<div class=\"card\"><div class=\"stats-grid\">"
-"<div class=\"stat\"><div class=\"num\" id=\"batches\">-</div><div class=\"lbl\">批次</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"batches\">-</div><div class=\"lbl\">完成批次</div></div>"
 "<div class=\"stat\"><div class=\"num\" id=\"packets\">-</div><div class=\"lbl\">总数据包</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"rate\">-</div><div class=\"lbl\">速率(pkt/s)</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"bandwidth\">-</div><div class=\"lbl\">带宽(B/s)</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"latency\">-</div><div class=\"lbl\">延迟(ms)</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"totalBytes\">-</div><div class=\"lbl\">总数据量(KB)</div></div>"
-"</div><div class=\"rate-bar\" style=\"margin-top:8px\"><div class=\"fill\" id=\"rateBar\" style=\"width:0%\"></div></div></div>"
-"<div class=\"card\"><h2>传输日志 (最近20条)</h2>"
+"<div class=\"stat\"><div class=\"num\" id=\"rate\">-</div><div class=\"lbl\">吞吐率(pkt/s)</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"bandwidth\">-</div><div class=\"lbl\">有效带宽(B/s)</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"blat\">-</div><div class=\"lbl\">批次往返延迟(ms)*</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"plat\">-</div><div class=\"lbl\">单包平均延迟(μs)</div></div>"
+"</div><div style=\"font-size:10px;color:#94a3b8;margin-top:4px\">"
+"*批次往返延迟 = Linux发送请求 → FreeRTOS处理 → 10包全部收完的总时间</div>"
+"<div class=\"rate-bar\" style=\"margin-top:8px\"><div class=\"fill\" id=\"rateBar\" style=\"width:0%\"></div></div></div>"
+"<div class=\"card\"><h2>传输日志 (最近30条)</h2>"
 "<div class=\"log-box\" id=\"logBox\">等待数据...</div></div></div>"
 "<div class=\"right\">"
 "<div class=\"card\"><h2>传感器数据</h2>"
@@ -153,11 +179,11 @@ static void serve_html(int fd) {
 "<b>面板:</b> <a href=\"http://192.168.88.11:8080\" style=\"color:#3b82f6\">http://192.168.88.11:8080</a></div>"
 "<div class=\"ctrl\"><button class=\"btn-warn\" onclick=\"fetch('/stats').then(r=>r.json()).then(d=>alert('状态正常: '+d.batches+'批, '+d.packets+'包'))\">📊 查看状态</button>"
 "<button class=\"btn-err\" onclick=\"if(confirm('确定停止面板服务器?')){alert('请在SSH中执行: pkill -9 -f dashboard_server')}\">⏹ 停止面板</button></div></div>"
-"<div class=\"card\"><h2>性能指标</h2>"
+"<div class=\"card\"><h2>异构通信资源消耗</h2>"
 "<div class=\"stats-grid\" style=\"grid-template-columns:1fr 1fr\">"
-"<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#059669\">409MB</div><div class=\"lbl\">共享内存</div></div>"
-"<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#d97706\">SGI 9</div><div class=\"lbl\">IPI中断</div></div>"
-"<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#3b82f6\">30B</div><div class=\"lbl\">单包大小</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"shmUsed\" style=\"font-size:18px;color:#059669\">-</div><div class=\"lbl\">共享内存使用</div></div>"
+"<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#d97706\">SGI 9</div><div class=\"lbl\">IPI中断号</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"totalKB\" style=\"font-size:18px;color:#3b82f6\">-</div><div class=\"lbl\">累计传输(KB)</div></div>"
 "<div class=\"stat\"><div class=\"num\" style=\"font-size:18px;color:#8b5cf6\">10</div><div class=\"lbl\">包/批次</div></div>"
 "</div></div></div></div>"
 "<script>"
@@ -168,8 +194,10 @@ static void serve_html(int fd) {
 "document.getElementById('packets').textContent=d.packets;"
 "document.getElementById('rate').textContent=d.rate.toFixed(1);"
 "document.getElementById('bandwidth').textContent=d.bandwidth.toFixed(1);"
-"document.getElementById('latency').textContent=d.latency_ms.toFixed(1);"
-"document.getElementById('totalBytes').textContent=(d.packets*36/1024).toFixed(1);"
+"document.getElementById('blat').textContent=d.batch_latency_ms.toFixed(2);"
+"document.getElementById('plat').textContent=d.pkt_latency_us.toFixed(0);"
+"document.getElementById('shmUsed').textContent=d.shm_used_mb.toFixed(1)+'/'+d.shm_total_mb+'MB('+d.shm_used_pct.toFixed(1)+'%)';"
+"document.getElementById('totalKB').textContent=(d.packets*36/1024).toFixed(1);"
 "var pct=Math.min(100,d.rate/50*100);"
 "document.getElementById('rateBar').style.width=pct+'%';"
 "var t=new Date().toLocaleTimeString();"
@@ -277,30 +305,35 @@ static void *rpmsg_thread(void *arg) {
                                  (g_batch_end.tv_nsec - g_batch_start.tv_nsec) / 1e9;
                 g_transfer_rate = (elapsed > 0) ? (float)(SENSOR_PACKET_COUNT / elapsed) : 0;
                 g_bandwidth = g_transfer_rate * (sizeof(SensorPacket) + 6);
-                g_avg_latency_ms = (float)(elapsed * 1000.0);
+                g_batch_latency_ms = (float)(elapsed * 1000.0);
+                g_pkt_latency_us = (elapsed > 0) ? (float)(elapsed * 1000000.0 / SENSOR_PACKET_COUNT) : 0;
 
-                double total_elapsed = (t_now.tv_sec - t_start.tv_sec) +
-                                       (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
                 double uptime = difftime(time(NULL), start_time);
-                /* 用总批次和运行时间计算总体速率 */
                 g_transfer_rate = (uptime > 0) ? (float)(g_total_packets / uptime) : 0;
                 g_bandwidth = g_transfer_rate * (sizeof(SensorPacket) + 6);
             }
 
-            /* 记录到CSV日志 */
+            /* 记录CSV (仅保留最近MAX_CSV_LINES行) */
             if (batch_count == SENSOR_PACKET_COUNT) {
+                static int csv_lines = 0;
                 static FILE *log_fp = NULL;
-                if (!log_fp) log_fp = fopen("/tmp/dashboard_data.csv", "a");
+                if (!log_fp) {
+                    log_fp = fopen(CSV_LOG_PATH, "w");
+                    if (log_fp) fprintf(log_fp, "#timestamp,batches,packets,rate_pkt_s,bandwidth_B_s,batch_latency_ms\n");
+                }
                 if (log_fp) {
-                    time_t now = time(NULL);
-                    fprintf(log_fp, "%ld,%d,%d,%.1f,%.1f,%.1f\n",
-                            now, g_total_batches, g_total_packets,
-                            g_transfer_rate, g_bandwidth, g_avg_latency_ms);
+                    if (csv_lines >= MAX_CSV_LINES) { fclose(log_fp); log_fp = fopen(CSV_LOG_PATH, "w");
+                        if (log_fp) fprintf(log_fp, "#timestamp,batches,packets,rate_pkt_s,bandwidth_B_s,batch_latency_ms\n");
+                        csv_lines = 0; }
+                    fprintf(log_fp, "%ld,%d,%d,%.1f,%.1f,%.2f\n",
+                            time(NULL), g_total_batches, g_total_packets,
+                            g_transfer_rate, g_bandwidth, g_batch_latency_ms);
                     fflush(log_fp);
+                    csv_lines++;
                 }
             }
 
-            sleep(2); /* 2秒间隔 */
+            sleep(BATCH_INTERVAL_SEC);
         }
 
         ioctl(ctrl_fd, RPMSG_DESTROY_EPT_IOCTL);
