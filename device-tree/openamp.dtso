@@ -1,0 +1,32 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "phytium,pe2204";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            reserved-memory {
+                #address-cells = <2>;
+                #size-cells = <2>;
+                ranges;
+
+                rproc@b0100000 {
+                    no-map;
+                    reg = <0x0 0xb0100000 0x0 0x19900000>;
+                    phandle = <100>;
+                };
+            };
+
+            homo_rproc {
+                compatible = "homo,rproc";
+                remote-processor = <3>;
+                inter-processor-interrupt = <9>;
+                memory-region = <100>;
+                firmware-name = "openamp_core0.elf";
+                status = "okay";
+            };
+        };
+    };
+};
