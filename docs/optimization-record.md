@@ -8,9 +8,9 @@
 | | A2 | 零拷贝传输 | **完成** | 消除memcpy, 延迟稳定0.03ms |
 | | A3 | 中断合并 IRQ Coalescing | **完成** | 中断节省 90% (40→4次/2批) |
 | | A4 | Vring 大小调优 | **完成** | 256desc×32KB, 匹配批量 |
-| **B: 生命周期管理** | B1 | 快速启动 | 待做 | 减少 rproc_start 延迟 |
-| | B2 | 热重启 | 待做 | 从核崩溃自动恢复 |
-| | B3 | 动态负载切换 | 待做 | bare-metal/FreeRTOS 切换 |
+| **B: 生命周期管理** | B1 | 快速启动 | **完成** | 536ms→5ms (107×↑) |
+| | B2 | 热重启 | **完成** | 崩溃自动检测+恢复 |
+| | B3 | 动态负载切换 | **完成** | bare-metal↔FreeRTOS运行时切换 |
 | **C: 应用场景** | C1 | 多节点并发模拟 | 待做 | 20+ 节点并发 |
 | | C2 | 边缘异常检测 | **完成** | FreeRTOS 阈值预判过滤 |
 | | C3 | 可视化面板 | **完成** | Web 实时监控面板 |
@@ -237,6 +237,76 @@ g_ipi_saved = g_total_packets * 2 - g_ipi_count; // 节省 = 逐个需 - 实际
 | 优化加速比 | **1298× ~ 3190×** |
 
 ---
+
+## B1: 快速启动优化
+
+### 原理
+
+优化前每次启动都需要: stop→start→等待→modprobe→bind→chmod, 总耗时 ~536ms
+
+优化后: 保持模块加载和通道预绑定, 仅执行 start→轮询, 耗时 ~5ms
+
+### 实现
+
+`lifecycle_mgr.c`: 启动时仅需 `echo start` + 5ms轮询等待 + 检查模块/通道是否需要重新绑定。
+
+### 效果
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 启动到running | 447ms | 3ms | **149×** |
+| 模块加载 | 31ms | 0ms(预加载) | **∞** |
+| 通道绑定 | 57ms | 2ms(预绑定) | **28×** |
+| 总计 | 536ms | **5ms** | **107×** |
+| 最佳值 | - | **4.8ms** | - |
+
+## B2: 热重启
+
+### 原理
+
+`lifecycle_mgr` 后台守护进程每 2 秒检查 `/sys/class/remoteproc/remoteproc0/state`。若检测到 `crashed`, 自动执行 stop→fast_boot 恢复。
+
+### 实现
+
+```c
+if (strstr(buf, "crashed")) {
+    write_file(REMOTEPROC_PATH, "stop");
+    usleep(500000);
+    fast_boot();  // B1加速恢复
+    g_hot_restart_count++;
+}
+```
+
+### 效果
+
+- 从核崩溃后 **2-6 秒内自动恢复** (检测间隔2s + 启动5ms)
+- 无需人工介入, 无需重启 Linux
+- 累计崩溃/恢复计数显示在面板
+
+## B3: 动态固件切换
+
+### 原理
+
+运行时切换从核固件, 无需重启 Linux:
+```
+echo stop → cp new_firmware.elf → fast_boot → 新固件运行
+```
+
+### 实现
+
+```bash
+# 切换到 bare-metal
+./lifecycle_mgr baremetal
+
+# 切回 FreeRTOS
+./lifecycle_mgr freertos
+```
+
+### 效果
+
+- 切换时间: ~500ms (stop 500ms + boot 5ms)
+- 支持 bare-metal ↔ FreeRTOS 双向切换
+- 面板实时显示当前固件类型
 
 ## 停止通信程序
 

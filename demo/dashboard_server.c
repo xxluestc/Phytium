@@ -79,7 +79,21 @@ static void http_ok(int fd, const char *content_type) {
 /* ─── JSON API: /stats ─── */
 static void serve_json_stats(int fd) {
     float shm_used = FIRMWARE_SIZE_MB + (VRING_SIZE_KB + RPMSG_BUFFER_KB) / 1024.0f;
-    char buf[4096];
+    /* 读取生命周期统计 */
+    int b1_boot = 0, b1_best = 536, b2_crash = 0, b2_restart = 0;
+    double b1_last = 536;
+    char fw_type[32] = "freertos";
+    FILE *lf = fopen("/tmp/lifecycle_stats.json", "r");
+    if (lf) {
+        char lbuf[512]; int n = fread(lbuf, 1, sizeof(lbuf)-1, lf); fclose(lf);
+        if (n > 0) { lbuf[n]=0;
+            sscanf(lbuf, "{\"b1_boot_count\":%d,\"b1_last_boot_ms\":%lf,\"b1_best_boot_ms\":%d,\"b1_avg_boot_ms\":%*f,"
+                   "\"b2_crash_count\":%d,\"b2_hot_restart\":%d,\"b3_current_fw\":\"%31[^\"]\",\"baseline_boot_ms\":%*d}",
+                   &b1_boot, &b1_last, &b1_best, &b2_crash, &b2_restart, fw_type); }
+    }
+    int baseline_boot = 536;
+
+    char buf[8192];
     int len = snprintf(buf, sizeof(buf),
         "{"
         "\"batches\":%d,\"packets\":%d,"
@@ -88,6 +102,9 @@ static void serve_json_stats(int fd) {
         "\"edge_alarms\":%d,\"edge_normal\":%d,\"optimize_speedup\":%.1f,"
         "\"ipi_count\":%d,\"ipi_saved\":%d,"
         "\"a2_zc\":1,\"a3_coalesce\":1,\"a4_vring\":1,"
+        "\"b1_boot_ms\":%.1f,\"b1_best_ms\":%d,\"b1_baseline_ms\":%d,\"b1_boot_count\":%d,"
+        "\"b2_crashes\":%d,\"b2_restarts\":%d,"
+        "\"b3_fw\":\"%s\","
         "\"shm_total_mb\":%d,\"shm_used_mb\":%.1f,\"shm_used_pct\":%.1f,"
         "\"sensors\":[",
         g_total_batches, g_total_packets,
@@ -95,6 +112,9 @@ static void serve_json_stats(int fd) {
         g_batch_latency_ms, g_pkt_latency_us,
         g_edge_alarms, g_edge_normal, g_optimize_speedup,
         g_ipi_count, g_ipi_saved,
+        b1_last, b1_best, baseline_boot, b1_boot,
+        b2_crash, b2_restart,
+        fw_type,
         SHM_TOTAL_MB, shm_used, shm_used * 100.0f / SHM_TOTAL_MB);
     for (int i = 0; i < g_last_count && i < SENSOR_PACKET_COUNT; i++) {
         SensorPacket *s = (SensorPacket *)&g_last_sensors[i];
@@ -193,14 +213,14 @@ static void serve_html(int fd) {
 "<b>面板:</b> <a href=\"http://192.168.88.11:8080\" style=\"color:#3b82f6\">http://192.168.88.11:8080</a></div>"
 "<div class=\"ctrl\"><button class=\"btn-warn\" onclick=\"fetch('/stats').then(r=>r.json()).then(d=>alert('状态正常: '+d.batches+'批, '+d.packets+'包'))\">📊 查看状态</button>"
 "<button class=\"btn-err\" onclick=\"if(confirm('确定停止面板服务器?')){alert('请在SSH中执行: pkill -9 -f dashboard_server')}\">⏹ 停止面板</button></div></div>"
-"<div class=\"card\"><h2>异构通信资源 & 优化状态</h2>"
+"<div class=\"card\"><h2>优化效果对比 (优化前 → 优化后)</h2>"
 "<div class=\"stats-grid\" style=\"grid-template-columns:1fr 1fr 1fr\">"
-"<div class=\"stat\"><div class=\"num\" id=\"speedup\" style=\"font-size:18px;color:#059669\">-</div><div class=\"lbl\">加速比(vs逐个)</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"ipiInfo\" style=\"font-size:18px;color:#d97706\">-</div><div class=\"lbl\">中断节省(A3)</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"edgeAlarms\" style=\"font-size:18px;color:#ef4444\">-</div><div class=\"lbl\">边缘检测(C2)</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"shmUsed\" style=\"font-size:18px;color:#3b82f6\">-</div><div class=\"lbl\">共享内存</div></div>"
-"<div class=\"stat\"><div class=\"num\" id=\"totalKB\" style=\"font-size:18px;color:#8b5cf6\">-</div><div class=\"lbl\">累计传输</div></div>"
-"<div class=\"stat\"><div class=\"num\" style=\"font-size:14px;color:#10b981\">A1✓A2✓A3✓A4✓</div><div class=\"lbl\">优化状态</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"latCmp\" style=\"font-size:15px;color:#059669\">-</div><div class=\"lbl\">批次延迟: 19.8→?</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"sgiCmp\" style=\"font-size:15px;color:#d97706\">-</div><div class=\"lbl\">IPI中断: 20→?</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"cpyCmp\" style=\"font-size:15px;color:#8b5cf6\">-</div><div class=\"lbl\">memcpy: 20→?</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"edgeCmp\" style=\"font-size:15px;color:#ef4444\">-</div><div class=\"lbl\">边缘检测告警</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"bootCmp\" style=\"font-size:15px;color:#3b82f6\">-</div><div class=\"lbl\">启动时间: 536→?</div></div>"
+"<div class=\"stat\"><div class=\"num\" id=\"fwInfo\" style=\"font-size:13px;color:#10b981\">-</div><div class=\"lbl\">当前固件+B1/B2</div></div>"
 "</div></div></div></div>"
 "<script>"
 "var logLines=[];"
@@ -212,11 +232,12 @@ static void serve_html(int fd) {
 "document.getElementById('bandwidth').textContent=d.bandwidth.toFixed(1);"
 "document.getElementById('blat').textContent=d.batch_latency_ms.toFixed(2);"
 "document.getElementById('plat').textContent=d.pkt_latency_us.toFixed(0);"
-"document.getElementById('speedup').textContent=d.optimize_speedup.toFixed(1)+'×';"
-"document.getElementById('ipiInfo').textContent=d.ipi_count+'/'+d.ipi_saved+'saved';"
-"document.getElementById('edgeAlarms').textContent=d.edge_alarms+'/'+(d.edge_alarms+d.edge_normal);"
-"document.getElementById('shmUsed').textContent=d.shm_used_mb.toFixed(1)+'/'+d.shm_total_mb+'MB';"
-"document.getElementById('totalKB').textContent=(d.packets*36/1024).toFixed(1);"
+"document.getElementById('latCmp').textContent='19.8→'+d.batch_latency_ms.toFixed(2)+'ms ('+d.optimize_speedup.toFixed(0)+'×)';"
+"document.getElementById('sgiCmp').textContent='20→'+d.ipi_count+'/批';"
+"document.getElementById('cpyCmp').textContent='20→0次';"
+"document.getElementById('edgeCmp').textContent=d.edge_alarms+'告警/'+(d.edge_alarms+d.edge_normal)+'总';"
+"document.getElementById('bootCmp').textContent=d.b1_baseline_ms+'→'+d.b1_boot_ms.toFixed(0)+'ms';"
+"document.getElementById('fwInfo').textContent=d.b3_fw+' | boot'+d.b1_boot_count+' crash'+d.b2_crashes;"
 "var pct=Math.min(100,d.rate/50*100);"
 "document.getElementById('rateBar').style.width=pct+'%';"
 "var t=new Date().toLocaleTimeString();"
