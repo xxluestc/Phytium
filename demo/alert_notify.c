@@ -11,14 +11,9 @@
 #include <time.h>
 
 /* ═══════════ 配置 ═══════════ */
-#define PLATFORM_FEISHU   1   /* 飞书 */
-#define PLATFORM_WECOM    2   /* 企业微信 */
-#define PLATFORM          PLATFORM_FEISHU  /* ← 选择平台 */
-
-#define FEISHU_URL   ""  /* 飞书Bot Webhook */
-#define WECOM_URL    ""  /* 企业微信Bot Webhook */
-#define LOG_FILE     "/tmp/grid_alerts.log"
-#define MAX_LOG_LINES 500
+#define PUSHPLUS_TOKEN  "292555a7b922440f8bd36bc79fe6e867"
+#define LOG_FILE        "/tmp/grid_alerts.log"
+#define MAX_LOG_LINES   500
 
 /* ═══════════ 告警级别 ═══════════ */
 typedef enum { LEVEL_NORMAL=0, LEVEL_WARN=1, LEVEL_DANGER=2 } AlertLevel;
@@ -49,65 +44,60 @@ static const char *time_str(const AlertMsg *a) {
     return buf;
 }
 
-/* ─── 飞书Bot通知 (卡片消息) ─── */
-static int feishu_notify(const AlertMsg *a) {
-    const char *url = FEISHU_URL;
-    if (!url || !url[0]) { printf("[WARN] FEISHU_URL 未配置\n"); return -1; }
+/* ─── PushPlus 微信推送 ─── */
+static int pushplus_notify(const AlertMsg *a) {
+    if (!PUSHPLUS_TOKEN[0]) return -1;
 
-    const char *colors[] = {"green", "yellow", "red"};
-    const char *titles[] = {"🟢 电网运行正常", "🟡 电网预警", "🔴 电网危险告警"};
-    const char *color = colors[a->level > 2 ? 0 : a->level];
-    const char *title = titles[a->level > 2 ? 0 : a->level];
+    const char *bg = a->level == 2 ? "#dc2626" : (a->level == 1 ? "#d97706" : "#059669");
+    const char *icons[] = {"🟢正常", "🟡预警", "🔴危险"};
 
-    char json[2048];
-    snprintf(json, sizeof(json),
-        "{\"msg_type\":\"interactive\",\"card\":{"
-        "\"header\":{\"title\":{\"content\":\"%s\",\"tag\":\"plain_text\"},"
-        "\"template\":\"%s\"},"
-        "\"elements\":["
-        "{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\","
-        "\"content\":\"**告警来源**: %s\\n**详情**: %s\\n**建议措施**: %s\\n**时间**: %s\"}},"
-        "{\"tag\":\"hr\"},"
-        "{\"tag\":\"note\",\"elements\":[{\"tag\":\"plain_text\","
-        "\"content\":\"Phytium Pi 电网安全监测系统\"}]}]}}",
-        title, color, a->source, a->detail, a->action, time_str(a));
+    /* HTML格式消息, 手机微信显示效果好 */
+    char content[1024];
+    snprintf(content, sizeof(content),
+        "<div style='padding:12px;border-left:4px solid %s;background:#fafafa;'>"
+        "<h2 style='color:%s;margin:0 0 8px'>%s 电网安全告警</h2>"
+        "<table style='width:100%%;font-size:14px'>"
+        "<tr><td style='color:#666;width:60px'>来源</td><td><b>%s</b></td></tr>"
+        "<tr><td style='color:#666'>详情</td><td>%s</td></tr>"
+        "<tr><td style='color:#666'>建议</td><td style='color:%s'><b>%s</b></td></tr>"
+        "<tr><td style='color:#666'>时间</td><td>%s</td></tr>"
+        "</table>"
+        "<p style='color:#999;font-size:11px;margin:8px 0 0'>Phytium Pi 电网安全监测系统</p></div>",
+        bg, bg, icons[a->level > 2 ? 0 : a->level],
+        a->source, a->detail, bg, a->action, time_str(a));
 
-    return curl_post(url, json);
+    /* URL 编码 (content) */
+    char encoded[2048];
+    char *p = encoded;
+    for (char *c = content; *c; c++) {
+        if (*c == ' ') *p++ = '+';
+        else if (*c == '\n') { *p++ = '%'; *p++ = '0'; *p++ = 'A'; }
+        else if (*c == '#' || *c == '%' || *c == '&' || *c == '=' || *c == '?' || *c == '\'' || *c == '"') {
+            snprintf(p, 4, "%%%02X", (unsigned char)*c); p += 3;
+        } else *p++ = *c;
+    }
+    *p = 0;
+
+    /* 直接用GET方式 (更稳定) */
+    char url[3072];
+    snprintf(url, sizeof(url),
+        "http://www.pushplus.plus/send?token=%s&title=%s&content=%s&template=html",
+        PUSHPLUS_TOKEN,
+        /* title也URL编码 */
+        a->level == 2 ? "%F0%9F%94%B4%E7%94%B5%E7%BD%91%E5%8D%B1%E9%99%A9" :
+        "%F0%9F%9F%A1%E7%94%B5%E7%BD%91%E9%A2%84%E8%AD%A6",
+        encoded);
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s --connect-timeout 5 '%s' 2>/dev/null &", url);
+    system(cmd);
+    return 0;
 }
 
-/* ─── 企业微信Bot通知 ─── */
-static int wecom_notify(const AlertMsg *a) {
-    const char *url = WECOM_URL;
-    if (!url || !url[0]) { printf("[WARN] WECOM_URL 未配置\n"); return -1; }
-
-    const char *icons[] = {"🟢", "🟡", "🔴"};
-    char json[2048];
-    snprintf(json, sizeof(json),
-        "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\""
-        "%s **电网安全告警**\\n"
-        ">来源: <font color=\\\"warning\\\">%s</font>\\n"
-        ">级别: <font color=\\\"%s\\\">%s</font>\\n"
-        ">详情: %s\\n"
-        ">建议: %s\\n"
-        ">时间: %s\"}}",
-        icons[a->level > 2 ? 0 : a->level],
-        a->source,
-        a->level == 2 ? "red" : "warning",
-        a->level == 2 ? "🔴危险" : (a->level == 1 ? "🟡预警" : "🟢正常"),
-        a->detail, a->action, time_str(a));
-
-    return curl_post(url, json);
-}
-
-/* ─── 发送通知 (根据平台自动选择) ─── */
+/* ─── 发送通知 ─── */
 static int push_notify(const AlertMsg *a) {
-#if PLATFORM == PLATFORM_FEISHU
-    return feishu_notify(a);
-#elif PLATFORM == PLATFORM_WECOM
-    return wecom_notify(a);
-#else
-    return -1;
-#endif
+    return pushplus_notify(a);
 }
 
 /* ─── 日志记录 ─── */
@@ -168,19 +158,10 @@ int main(int argc, char *argv[]) {
     printf("=== 电网预警通知模块测试 ===\n\n");
 
     /* 测试1: 配置检查 */
-#if PLATFORM == PLATFORM_FEISHU
-    printf("[PLATFORM] 飞书\n");
-    if (!FEISHU_URL[0]) {
-        printf("[CONFIG] FEISHU_URL 未配置\n");
-        printf("  获取: 飞书 → 群设置 → 群机器人 → 添加 → 复制Webhook\n\n");
-    }
-#elif PLATFORM == PLATFORM_WECOM
-    printf("[PLATFORM] 企业微信\n");
-    if (!WECOM_URL[0]) {
-        printf("[CONFIG] WECOM_URL 未配置\n");
-        printf("  获取: 企业微信 → 群设置 → 群机器人 → 添加 → 复制Webhook\n\n");
-    }
-#endif
+    printf("[PLATFORM] PushPlus (微信推送)\n");
+    printf("[TOKEN]  %s...%s\n",
+           PUSHPLUS_TOKEN[0] ? PUSHPLUS_TOKEN : "(未配置)",
+           PUSHPLUS_TOKEN[0] ? "" : "");
 
     /* 测试2: 各级别告警 (日志记录, WeCom仅在有Webhook时发送) */
     printf("─── 天气预警 (WARN) ───\n");
