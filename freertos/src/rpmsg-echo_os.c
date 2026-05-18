@@ -410,8 +410,18 @@ static int rpmsg_endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
              * 数据格式: [2B length][nB lora_frame]
              * 注入到 master_recv 处理管线进行帧解析和混沌解密。
              */
+            g_ept = ept;
+
+            /* 测试：收到握手帧时立即回发一个测试DEVICE_MASTER_CMD */
+            {
+                ProtocolData test = {.command = DEVICE_MASTER_CMD,
+                                     .length = 2,
+                                     .data = {0x00, 0xFF}};
+                int tr = rpmsg_send(ept, &test, 6 + test.length);
+                OPENAMP_DEVICE_INFO("handshake echo test: ret=%d\r\n", tr);
+            }
+
             if (protocol_data.length > 0 && protocol_data.length <= MAX_DATA_LENGTH) {
-                g_ept = ept;
                 master_recv_inject_data((const uint8_t *)protocol_data.data,
                                         protocol_data.length);
             }
@@ -450,6 +460,7 @@ static int FRpmsgEchoApp(struct rpmsg_device *rdev, void *priv)
     }
 
     g_remoteproc_priv = priv;
+    g_ept = &lept;
     OPENAMP_DEVICE_INFO("Successfully created rpmsg endpoint.\r\n");
 
     while (1)

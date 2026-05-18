@@ -1,0 +1,271 @@
+version: "4.1"
+name: GD32L233C_Prj
+type: ARM
+deviceName: GD32L233RC
+packDir: .pack/GigaDevice/GD32L23x_DFP.1.0.1
+srcDirs: []
+virtualFolder:
+  name: <virtual_root>
+  files: []
+  folders:
+    - name: app
+      files:
+        - path: app/main.c
+        - path: app/chaos_encrypt.c
+        - path: app/log.c
+        - path: app/data_frame.c
+      folders: []
+    - name: Firmware
+      files:
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_adc.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_cau.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_cau_aes.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_cau_des.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_cau_tdes.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_cmp.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_crc.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_ctc.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_dac.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_dbg.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_dma.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_exti.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_fmc.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_fwdgt.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_gpio.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_i2c.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_lptimer.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_lpuart.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_misc.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_pmu.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_rcu.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_rtc.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_slcd.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_spi.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_syscfg.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_timer.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_trng.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_usart.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_vref.c
+        - path: Firmware/GD32L23x_standard_peripheral/Source/gd32l23x_wwdgt.c
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_adc.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_cau.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_cmp.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_crc.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_ctc.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_dac.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_dbg.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_dma.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_exti.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_fmc.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_fwdgt.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_gpio.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_i2c.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_lptimer.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_lpuart.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_misc.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_pmu.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_rcu.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_rtc.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_slcd.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_spi.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_syscfg.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_timer.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_trng.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_usart.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_vref.h
+        - path: Firmware/GD32L23x_standard_peripheral/Include/gd32l23x_wwdgt.h
+      folders: []
+    - name: gd32_sys
+      files:
+        - path: gd32_sys/gd32l23x_it.c
+        - path: gd32_sys/gd32l23x_it.h
+        - path: gd32_sys/gd32l23x_libopt.h
+        - path: gd32_sys/systick.c
+        - path: gd32_sys/systick.h
+      folders: []
+    - name: Utilities
+      files:
+        - path: Firmware/CMSIS/GD/GD32L23x/Source/ARM/startup_gd32l23x.s
+      folders: []
+    - name: CMSIS
+      files:
+        - path: Firmware/CMSIS/GD/GD32L23x/Source/system_gd32l23x.c
+        - path: Firmware/CMSIS/GD/GD32L23x/Include/system_gd32l23x.h
+        - path: Firmware/CMSIS/GD/GD32L23x/Include/gd32l23x.h
+      folders: []
+    - name: FreeRTOS
+      files:
+        - path: FreeRTOS/croutine.c
+        - path: FreeRTOS/event_groups.c
+        - path: FreeRTOS/list.c
+        - path: FreeRTOS/queue.c
+        - path: FreeRTOS/stream_buffer.c
+        - path: FreeRTOS/tasks.c
+        - path: FreeRTOS/timers.c
+        - path: FreeRTOS/portable/Common/mpu_wrappers.c
+        - path: FreeRTOS/portable/GCC/ARM_CM23_NTZ/non_secure/port.c
+        - path: FreeRTOS/portable/GCC/ARM_CM23_NTZ/non_secure/portasm.c
+        - path: FreeRTOS/portable/MemMang/heap_4.c
+        - path: FreeRTOS/config/FreeRTOSConfig.h
+      folders: []
+    - name: task
+      files:
+        - path: app/task/master_cmd.c
+        - path: app/task/master_judge.c
+        - path: app/task/master_recv.c
+        - path: app/task/master_sys.c
+      folders: []
+    - name: BSP
+      files:
+        - path: app/BSP/gd32l233r_eval.c
+        - path: app/BSP/gd32l233r_eval.h
+        - path: app/BSP/mwcc68_app.c
+        - path: app/BSP/mwcc68_uart.c
+      folders: []
+    - name: ::CMSIS
+      files: []
+      folders: []
+dependenceList: []
+outDir: build
+miscInfo:
+  uid: da042cddc4002792d84e2f5d9b7c39ce
+targets:
+  Gd32L233C_START:
+    cppPreprocessAttrs:
+      defineList: []
+      incList:
+        - .
+        - gd32_sys
+        - Utilities
+        - app
+        - Firmware/CMSIS/GD/GD32L23x/Include
+        - Firmware/GD32L23x_standard_peripheral/Include
+        - FreeRTOS/include
+        - FreeRTOS/config
+        - FreeRTOS/portable/GCC/ARM_CM23_NTZ/non_secure
+        - app/task
+        - app/BSP
+        - .cmsis/include
+        - RTE/_Gd32L233C_START
+      libList: []
+    excludeList: []
+    settings: {}
+    toolchain: AC6
+    toolchainConfigMap:
+      AC6:
+        archExtensions: ""
+        cpuType: Cortex-M23
+        floatingPointHardware: none
+        options:
+          version: 3
+          afterBuildTasks: []
+          asm-compiler:
+            $use: asm-auto
+            defines: []
+            misc-controls: ""
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            language-c: c99
+            language-cpp: c++11
+            link-time-optimization: false
+            one-elf-section-per-function: true
+            optimization: level-0
+            short-enums#wchar: true
+            warnings: ac5-like-warnings
+          global:
+            output-debug-info: enable
+            use-microLIB: true
+          linker:
+            $outputTaskExcludes:
+              - .bin
+            misc-controls: --diag_suppress=L6329
+            output-format: elf
+            ro-base: "0x08000000"
+            rw-base: "0x20000000"
+            xo-base: ""
+        scatterFilePath: ""
+        storageLayout:
+          RAM:
+            - id: 1
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: RAM
+            - id: 2
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: RAM
+            - id: 3
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: RAM
+            - id: 1
+              isChecked: true
+              mem:
+                size: "0x8000"
+                startAddr: "0x20000000"
+              noInit: false
+              tag: IRAM
+            - id: 2
+              isChecked: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              noInit: false
+              tag: IRAM
+          ROM:
+            - id: 1
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: ROM
+            - id: 2
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: ROM
+            - id: 3
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: ROM
+            - id: 1
+              isChecked: true
+              isStartup: true
+              mem:
+                size: "0x40000"
+                startAddr: "0x8000000"
+              tag: IROM
+            - id: 2
+              isChecked: false
+              isStartup: false
+              mem:
+                size: "0x0"
+                startAddr: "0x0"
+              tag: IROM
+        useCustomScatterFile: false
+    uploadConfigMap:
+      JLink:
+        baseAddr: ""
+        bin: ""
+        cpuInfo:
+          cpuName: "null"
+          vendor: "null"
+        otherCmds: ""
+        proType: 1
+        speed: 8000
+    uploader: JLink

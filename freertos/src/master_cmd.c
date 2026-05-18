@@ -56,7 +56,15 @@ static void send_lora_cmd(uint8_t node_id, uint8_t cmd_code, const uint8_t *para
         if (n) { n->wave_pending = 0; n->cmd_retry = 0; }
         log_debug("CMD node%d sent via RPMsg, code=0x%02X", node_id, cmd_code);
     } else {
-        log_warn("CMD node%d send failed, ret=%d", node_id, ret);
+        MasterNodeInfo_t *n = master_get_node_info(node_id);
+        if (n) {
+            n->cmd_retry++;
+            if (n->cmd_retry < MASTER_CMD_RETRY_MAX) {
+                n->wave_pending = 0;
+            }
+        }
+        log_warn("CMD node%d send failed, ret=%d, retry=%d",
+                 node_id, ret, n ? n->cmd_retry : 0);
     }
 
     (void)g_lora_pkt;
