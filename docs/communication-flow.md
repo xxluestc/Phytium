@@ -1,495 +1,339 @@
 # OpenAMP 异构多核通信流程详解
 
-> **当前状态**: 设备树已配置 → Bare-metal/FreeRTOS 双版本 → A1批量合并(659×) → C2边缘异常检测 → Web面板实时监控
+> **更新**: 2026-05-18 | **当前架构**: Linux主核 + FreeRTOS从核 (GD32移植版)
 
-## 1. 架构总览
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Phytium PE2204 SoC                            │
-│                                                                  │
-│  Linux主核 (CPU0-2, SMP)          FreeRTOS/bare-metal 从核       │
-│  ┌─────────────────────────┐    ┌─────────────────────────────┐ │
-│  │  CPU0: FTC310           │    │   CPU3: FTC664 (独占)       │ │
-│  │  CPU1: FTC310           │    │                             │ │
-│  │  CPU2: FTC664           │    │  RpmsgEchoTask (FreeRTOS)   │ │
-│  │                         │    │  或 main() (bare-metal)     │ │
-│  │  sensor_receiver        │    │       ↑                     │ │
-│  │       ↓                 │    │  RPMsg endpoint             │ │
-│  │  /dev/rpmsg_ctrl0       │    │       ↑                     │ │
-│  │  /dev/rpmsg0 (数据通道)  │    │  OpenAMP lib                │ │
-│  │       ↓                 │    │       ↑                     │ │
-│  │  rpmsg_char.ko          │    │  virtio (vring)             │ │
-│  │       ↓                 │    │       ↑                     │ │
-│  │  virtio_rpmsg_bus       │    │  libmetal                   │ │
-│  │       ↓                 │    │       ↑                     │ │
-│  │  rproc-virtio           │    │  FreeRTOS Kernel / 裸机     │ │
-│  │       ↓                 │    │       ↑                     │ │
-│  │  homo_remoteproc        │    │  PSCI CPU_ON                │ │
-│  └──────────┬──────────────┘    └──────────────┬──────────────┘ │
-│             │                                  │                │
-│             │  ┌──────────────────────────┐    │                │
-│             └──│   共享内存 (0xB0100000)    │────┘                │
-│                │   - vring0 (TX)           │                     │
-│                │   - vring1 (RX)           │                     │
-│                │   - RPMsg buffers         │                     │
-│                │   - 固件代码+数据          │                     │
-│                └──────────────────────────┘                     │
-│                                                                  │
-│             ┌──────────────────────────┐                        │
-│             │   IPI 中断 (GICv3 SGI 9) │                        │
-│             │   Linux ←→ 从核 通知     │                        │
-│             └──────────────────────────┘                        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### CPU 分配
-
-| CPU | 核心 | MPIDR | 用途 |
-|-----|------|-------|------|
-| CPU0 | FTC310 | 0x200 | Linux SMP |
-| CPU1 | FTC310 | 0x201 | Linux SMP |
-| CPU2 | FTC664 | 0x000 | Linux SMP |
-| CPU3 | FTC664 | 0x100 | **从核 (OpenAMP 独占)** |
-
-### 从核操作系统
-
-| 类型 | SDK | 源文件 | 入口 |
-|------|-----|--------|------|
-| **FreeRTOS** (当前) | phytium-free-rtos-sdk | `rpmsg-echo_os.c` | `main()` → `xTaskCreate(RpmsgEchoTask)` → `vTaskStartScheduler()` |
-| Bare-metal | phytium-standalone-sdk | `slaver_00_example.c` | `main()` → `slave_init()` → `FRpmsgEchoApp()` |
-
-## 2. 通信流程 (Linux → 从核 → Linux)
-
-### 2.1 启动阶段
+## 1. 通信架构总览
 
 ```
-Step 1: Linux 启动
-  └── 内核解析设备树 → 发现 homo_rproc@0 节点
-      └── homo_remoteproc 驱动 probe
-          ├── 解析 reserved-memory (0xB0100000, 409MB)
-          ├── 映射共享内存为可执行 (PAGE_KERNEL_EXEC)
-          ├── 注册 SGI 9 中断处理
-          ├── 注册 CPU hotplug 回调
-          ├── homo_core_of_init() → 解析子节点 "homo,rproc-core"
-          └── rproc_add() → /sys/class/remoteproc/remoteproc0
+┌──────────────────────────────────────────────────────────────────┐
+│                     Phytium PE2204 SoC                            │
+│                                                                   │
+│  Linux 主核 (CPU0-2)               FreeRTOS 从核 (CPU3)          │
+│  ┌────────────────────────┐      ┌───────────────────────────┐  │
+│  │  master_receiver       │      │  RpmsgEchoTask (Prio=4)    │  │
+│  │  src/openamp-demo/     │      │  rpmsg-echo_os.c           │  │
+│  │  linux-master/         │      │                            │  │
+│  │  master_receiver.c     │      │  ┌─ DEVICE_MASTER_DATA ←──┼──┤
+│  │       ↕                │      │  └─ DEVICE_MASTER_CMD  ──→┼──┤
+│  │  /dev/rpmsg0           │RPMsg │                            │  │
+│  │  /dev/rpmsg_ctrl0      │←────→│  master_recv_task(Prio=4) │  │
+│  │       ↕                │SGI 9 │  master_recv.c             │  │
+│  │  rpmsg_char.ko         │      │                            │  │
+│  │  virtio_rpmsg_bus      │      │  master_judge_task(Prio=5) │  │
+│  │  homo_remoteproc       │      │  master_judge.c            │  │
+│  └───────────┬────────────┘      │                            │  │
+│              │                   │  master_cmd_task(Prio=3)   │  │
+│              │    ┌──────────────┴──────────────────────────┐ │  │
+│              └────│ 共享内存 0xB0100000 (409MB)              │ │  │
+│                   │ vring0(TX) + vring1(RX) + 缓冲区 + 固件  │ │  │
+│                   └─────────────────────────────────────────┘ │  │
+│                                                                   │
+│              ┌──────────────────────────┐                        │
+│              │  IPI 中断 (GICv3 SGI 9)  │                        │
+│              │  Linux ←→ FreeRTOS 通知  │                        │
+│              └──────────────────────────┘                        │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-Step 2: 用户启动从核
-  $ echo start > /sys/class/remoteproc/remoteproc0/state
-  └── homo_rproc_start()
-      ├── remove_cpu(3)            # 下电 CPU3
-      ├── 加载 openamp_core0.elf 到 0xB0100000
-      ├── 刷新 I/D-Cache
-      └── PSCI CPU_ON → CPU3 从 0xB0100000 开始执行
+## 2. 完整数据流: FreeRTOS 接收到数据处理 → Linux 接收并展示
 
-Step 3: 从核初始化 (FreeRTOS)
-  └── openamp_core0.elf 启动
-      ├── main() 入口
-      ├── rpmsg_echo_task() → xTaskCreate(RpmsgEchoTask, 8KB栈, 优先级4)
-      ├── vTaskStartScheduler() → FreeRTOS 调度器启动
-      ├── RpmsgEchoTask:
-      │   ├── device_init() - 初始化 libmetal + OpenAMP
-      │   ├── 创建 RPMsg 端点 "rpmsg-openamp-demo-channel"
-      │   └── FRpmsgEchoApp() - 主循环 platform_poll()
-      └── 等待主核消息
+### 第1步: 数据到达 FreeRTOS 从核
+
+**数据来源(二选一)**:
+
+| 方式 | 函数 | 文件 | 状态 |
+|------|------|------|------|
+| 物理LoRa模块 | `master_recv_lora_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **Stub (返回0)** |
+| RPMsg注入 | `master_recv_inject_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **可用** |
+
+**RPMsg注入路径** (当前可验证):
+```
+Linux (master_receiver.c)
+  → write() → /dev/rpmsg0
+    → rpmsg_char.ko
+      → virtio_rpmsg_bus
+        → vring0 (共享内存)
+          → SGI 9 中断 → FreeRTOS
+
+FreeRTOS (rpmsg-echo_os.c)
+  → platform_poll() 检测到消息
+    → rpmsg_endpoint_cb()
+      → case DEVICE_MASTER_DATA (0x0020):
+          → master_recv_inject_data(data, len)
+```
+
+### 第2步: LoRa帧解析
+
+**文件**: [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c)
+**任务**: `master_recv_task` (优先级4)
+
+```
+master_recv_task()
+  ├── 获取原始数据
+  └── parse_frame(raw_data, raw_len, out_data, out_len, out_type, out_timestamp)
+      ├── 帧同步头检测: 0xAA 0x55
+      ├── CRC8 校验: calc_frame_crc8()
+      └── 按数据类型分流:
+          ├── 故障/状态头 → process_status_header()
+          │   解析 FaultUploadHeader_t / NodeUploadData_t
+          │   记录节点ID、故障类型、严重等级、采样率等
+          │   [数据结构定义: freertos/inc/data_frame.h]
+          │
+          ├── 状态采样数据 → process_node_raw()
+          │   按节点累积采样点 (NodeSample_t)
+          │   完整后 → master_flash_save_node_data()
+          │   [存储: freertos/src/master_sys.c → g_status_buf[]]
+          │
+          ├── 波形头 → process_wave_header()
+          │   解析 WaveChunkHeader_t (采样率、采样点数)
+          │   [存储: freertos/src/master_sys.c → master_flash_erase_wave()]
+          │
+          ├── 波形数据 → process_flash_wave()
+          │   按偏移量写入波形数据
+          │   [存储: freertos/src/master_sys.c → g_wave_buf[]]
+          │
+          └── 故障列表 → process_fault_list()
+              解析有效故障条目
+```
+
+### 第3步: 故障判决
+
+**文件**: [freertos/src/master_judge.c](file:///home/alientek/Phytium/freertos/src/master_judge.c)
+**任务**: `master_judge_task` (优先级5, 最高)
+**周期**: 1000ms
+
+```
+master_judge_task()
+  └── 每1秒遍历 MASTER_MAX_NODES (10) 个节点:
+      ├── 检查 g_nodes[i] 状态
+      ├── 离线检测: now - last_recv_time > 15000ms → is_online = 0
+      └── 故障判定:
+          如果 severity >= SEVERITY_WARNING && fault_type != FAULT_NONE:
+            构造 MasterInternalCmd_t:
+              cmd_type = MASTER_CMD_REQ_WAVE
+              node_id  = i
+              sample_rate = 6000
+              duration_ms = 250
+            → xQueueSend(g_master_cmd_queue, &cmd)
+```
+
+### 第4步: 命令生成与加密
+
+**文件**: [freertos/src/master_cmd.c](file:///home/alientek/Phytium/freertos/src/master_cmd.c)
+**任务**: `master_cmd_task` (优先级3, 最低)
+
+```
+master_cmd_task()
+  └── xQueueReceive(g_master_cmd_queue, &cmd)  // 阻塞等待
+      └── switch(cmd.cmd_type):
+          ├── MASTER_CMD_REQ_WAVE:
+          │   send_lora_cmd(node_id, CMD_REQUEST_WAVEFORM, params, 2)
+          ├── MASTER_CMD_REQ_FAULT_LIST:
+          │   send_lora_cmd(node_id, CMD_REQUEST_FAULT_LIST, NULL, 0)
+          ├── MASTER_CMD_CLEAR_FLASH:
+          │   send_lora_cmd(node_id, CMD_CLEAR_FLASH, NULL, 0)
+          └── MASTER_CMD_WAVE_COLLECT:
+              send_lora_cmd(node_id, CMD_START_WAVE_COLLECT, params, 2)
+
+send_lora_cmd():
+  ├── chaos_encrypt_packet()   ← 混沌加密 [freertos/src/chaos_encrypt.c]
+  └── rpmsg_send_master_cmd()  ← RPMsg发送 [freertos/src/rpmsg-echo_os.c]
+```
+
+### 第5步: 跨核 RPMsg 传输 (FreeRTOS → Linux)
+
+**发送方文件**: [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c)
+**函数**: `rpmsg_send_master_cmd(node_id, cmd_code, params, param_len)`
+
+```
+rpmsg_send_master_cmd()
+  ├── 构造 ProtocolData:
+  │   command = DEVICE_MASTER_CMD (0x0021)
+  │   length  = 2 + param_len
+  │   data[0] = node_id
+  │   data[1] = cmd_code
+  │   data[2..] = params
+  └── rpmsg_send(g_ept, &tx_data, 6 + tx_data.length)
+      ├── 写入 vring1 (共享内存 RX vring)
+      └── 触发 IPI 中断 → Linux
+
+【物理路径】
+FreeRTOS CPU3:
+  rpmsg_send() → virtio_queue_notify() → 写入 GICv3 SGI 9 寄存器
+  → 中断路由到 Linux CPU0-2
+
+Linux 内核:
+  rproc_vq_interrupt() → virtio_rpmsg_bus → rpmsg_char.ko
+  → 数据到达 /dev/rpmsg0 读缓冲区
+```
+
+### 第6步: Linux 应用接收与处理
+
+**文件**: [src/openamp-demo/linux-master/master_receiver.c](file:///home/alientek/Phytium/src/openamp-demo/linux-master/master_receiver.c)
+
+```
+main() 启动:
+  ├── open("/dev/rpmsg_ctrl0")        ← 打开控制设备
+  ├── ioctl(CREATE_EPT, "rpmsg-openamp-demo-channel")  ← 创建RPMsg端点
+  └── open("/dev/rpmsg0")             ← 打开数据通道
+
+while(running):
+  └── read(rpmsg_fd, rx_buf)
+      └── 解析 ProtocolData:
+          ├── command = DEVICE_MASTER_CMD (0x0021):
+          │   print_master_cmd():
+          │     node_id = pkt->data[0]
+          │     cmd_code = pkt->data[1]
+          │     → 打印: "[CMD] node=X cmd=REQ_WAVE(0x10)"
+          └── (后续可用) DEVICE_MASTER_DATA → 打印LoRa帧内容
+```
+
+### 第7步: (后续) Linux → LoRa模块 → 终端节点
+
+```
+待实现路径:
+master_receiver
+  → 解析 DEVICE_MASTER_CMD
+  → 获取命令参数 (node_id, cmd_code, params)
+  → 通过 UART3 发送到 ATK-MWCC68D LoRa 模块
+    → LoRa 模块无线发送
+      → 终端节点接收并执行命令
+```
+
+## 3. 数据格式定义
+
+### RPMsg 消息格式
+
+所有消息遵循统一的 `ProtocolData` 格式:
+
+```
+[4B command][2B length][nB data]
+```
+
+| 字段 | 大小 | 说明 |
+|------|------|------|
+| command | 4字节 | 消息类型 (0x0020/0x0021/0x0010/0x0011等) |
+| length | 2字节 | data字段长度 |
+| data | 变长 | 消息载荷 |
+
+定义位置: [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c) 和 [src/openamp-demo/linux-master/master_receiver.c](file:///home/alientek/Phytium/src/openamp-demo/linux-master/master_receiver.c)
+
+### LoRa 帧格式
+
+```
+[0xAA][0x55][LEN][NODE_ID][TYPE][PAYLOAD][CRC8][0x55][0xAA]
+```
+
+定义位置: [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c)
+
+### 数据结构定义
+
+全部在 [freertos/inc/data_frame.h](file:///home/alientek/Phytium/freertos/inc/data_frame.h):
+
+| 结构体 | 用途 |
+|--------|------|
+| `NodeSample_t` | 节点采样数据 (有功功率、无功功率、电压) |
+| `NodeUploadData_t` | 节点上传数据头 |
+| `FaultUploadHeader_t` | 故障上传数据头 |
+| `WaveChunkHeader_t` | 波形数据块头 |
+
+## 4. 各环节对应文件速查
+
+| 环节 | 步骤 | 文件路径 | 核心函数 |
+|------|------|---------|---------|
+| 数据到达 | 1 | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | `master_recv_lora_data()` / `master_recv_inject_data()` |
+| RPMsg接收 | 1 | [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c) | `rpmsg_endpoint_cb()` → `DEVICE_MASTER_DATA` |
+| 帧解析 | 2 | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | `parse_frame()` → CRC8 + 数据分流 |
+| 数据结构 | 2 | [freertos/inc/data_frame.h](file:///home/alientek/Phytium/freertos/inc/data_frame.h) | `NodeSample_t`, `FaultUploadHeader_t` 等 |
+| 状态存储 | 2 | [freertos/src/master_sys.c](file:///home/alientek/Phytium/freertos/src/master_sys.c) | `master_flash_save_node_data()` |
+| 波形存储 | 2 | [freertos/src/master_sys.c](file:///home/alientek/Phytium/freertos/src/master_sys.c) | `master_flash_save_wave_data()` |
+| 故障判决 | 3 | [freertos/src/master_judge.c](file:///home/alientek/Phytium/freertos/src/master_judge.c) | `master_judge_task()` 1秒周期 |
+| 命令入队 | 3 | [freertos/src/master_judge.c](file:///home/alientek/Phytium/freertos/src/master_judge.c) | `xQueueSend(g_master_cmd_queue)` |
+| 命令加密 | 4 | [freertos/src/master_cmd.c](file:///home/alientek/Phytium/freertos/src/master_cmd.c) | `chaos_encrypt_packet()` |
+| 命令发送 | 4 | [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c) | `rpmsg_send_master_cmd()` |
+| 跨核传输 | 5 | 共享内存 + SGI 9 | RPMsg over VirtIO |
+| Linux接收 | 6 | [src/openamp-demo/linux-master/master_receiver.c](file:///home/alientek/Phytium/src/openamp-demo/linux-master/master_receiver.c) | `read()` → `print_master_cmd()` |
+| LoRa发送 | 7 | (待实现) | Linux UART → LoRa模块 → 终端节点 |
+
+## 5. 启动流程
+
+```
+Step 1: Linux 加载驱动
+  sudo modprobe rpmsg_char rpmsg_ctrl
+
+Step 2: 启动 FreeRTOS 从核
+  echo start > /sys/class/remoteproc/remoteproc0/state
+  → homo_rproc_start()
+    → remove_cpu(3) / 加载固件到 0xB0100000
+    → PSCI CPU_ON → CPU3 开始执行
+
+Step 3: FreeRTOS 初始化
+  main() [freertos/main.c]
+    → chaos_init() → master_init() → master_task_create()
+    → rpmsg_echo_task() → xTaskCreate(RpmsgEchoTask)
+    → vTaskStartScheduler()
 
 Step 4: RPMsg 通道建立
-  └── virtio_rpmsg_bus 检测到从核端点
-      └── 创建设备: /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0
+  RpmsgEchoTask → device_init()
+    → platform_create_proc() / platform_setup_share_mems()
+    → platform_create_rpmsg_vdev() →创建 VirtIO RPMsg 设备
+    → rpmsg_create_ept("rpmsg-openamp-demo-channel")
+  virtio_rpmsg_bus 检测到端点 → 创建 /sys/bus/rpmsg/devices/
 
-Step 5: 用户绑定驱动
-  $ echo rpmsg_chrdev > .../driver_override
-  $ echo virtio0... > .../rpmsg_chrdev/bind
-  └── /dev/rpmsg0 创建
+Step 5: 绑定用户驱动
+  echo rpmsg_chrdev > .../driver_override
+  echo virtio0... > .../bind
+  → /dev/rpmsg0 创建
+
+Step 6: Linux 应用连接
+  master_receiver.c
+    → open("/dev/rpmsg_ctrl0")
+    → ioctl(CREATE_EPT, "rpmsg-openamp-demo-channel")
+    → open("/dev/rpmsg0")
 ```
 
-### 2.2 传感器数据通信流程 (当前实现)
-
-```
-Linux (sensor_receiver)               FreeRTOS从核 (RpmsgEchoTask)
-────────────────────────               ──────────────────────────
-1. ioctl(CREATE_EPT, "rpmsg-openamp-demo-channel")
-   在 /dev/rpmsg_ctrl0 创建端点
-                                       (等待消息...)
-2. write(DEVICE_SENSOR_DATA)  ────→   3. rpmsg_endpoint_cb()
-   发送传感器数据请求                      收到 DEVICE_SENSOR_DATA 命令
-                                           ↓
-                                      4. send_all_sensor_packets()
-                                         发送10组传感器数据:
-                                          Packet 1: ID=1, V=220.5, A=1.25, T=27.3
-                                          Packet 2: ID=2, V=221.0, A=1.30, T=28.1
-                                          ...
-                                          Packet 10: ID=10, V=221.2, A=1.32, T=35.2
-                                          (每组间隔 platform_poll 处理vring)
-5. read() ← 接收10个数据包
-   逐个解析 SensorPacket
-   打印: [PKT X] ID=X ts=X V=X A=X T=X [STATUS]
-                                          ↓
-6. 打印标志位:
-   [COMPLETED] Batch N: Received 10/10
-   [STATS] Total: N batches, N*10 packets
-                                          ↓
-7. sleep(2) → 下一批请求 ────────→     (等待下一批请求...)
-   重复步骤2-7 (持续运行)
-```
-
-### 2.3 基础回显通信流程 (rpmsg-demo-single)
-
-```
-Linux 用户程序                     内核                        从核
-─────────────                     ────                        ────
-write(fd, CHECK命令+数据)
-  └── rpmsg_char.ko
-      └── virtio_rpmsg_bus
-          └── 将数据写入 vring0
-              └── SGI 9 → 从核
-                                        ──→ rpmsg_recv()
-                                            └── 回显相同数据
-                                            └── rpmsg_send() → vring1
-  ←── rproc_vq_interrupt()
-  ←── virtio_rpmsg_bus
-  ←── rpmsg_char.ko
-read(fd, buf) ← "Hello World! No:X"
-```
-
-### 2.4 关键数据路径
-
-```
-发送: 用户程序 → write() → /dev/rpmsg0 → rpmsg_char → virtio_rpmsg_bus
-      → vring (共享内存) → SGI 9 → 从核 → rpmsg_recv()
-
-接收: 从核 → rpmsg_send() → vring (共享内存) → IPI → Linux
-      → rproc_vq_interrupt() → virtio_rpmsg_bus → rpmsg_char
-      → /dev/rpmsg0 → read() → 用户程序
-```
-
-## 3. 代码修改方法
-
-### 3.1 FreeRTOS 从核代码 (当前使用)
-
-**位置**: `phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux/`
-
-```
-openamp_for_linux/
-├── main.c              ← FreeRTOS 入口 (创建任务, 启动调度器)
-├── src/
-│   └── rpmsg-echo_os.c ← ★ 通信逻辑 + 传感器数据发送
-├── common/             ← 共享头文件
-├── configs/            ← 平台配置文件
-│   └── pe2204_aarch64_phytiumpi_openamp_for_linux.config
-├── Kconfig             ← Kconfig (需FREERTOS_SDK_DIR)
-└── makefile            ← 构建配置
-```
-
-**修改从核逻辑** → 在 `rpmsg-echo_os.c` 中:
-- `rpmsg_endpoint_cb()` — 消息处理回调 (添加新命令)
-- `send_all_sensor_packets()` — 传感器数据批量发送
-- `RpmsgEchoTask()` — FreeRTOS 任务入口
-
-### 3.2 Bare-metal 从核代码
-
-**位置**: `phytium-standalone-sdk-master/example/system/amp/openamp_for_linux/`
-
-```
-openamp_for_linux/
-├── main.c              ← 从核主入口
-├── src/
-│   └── slaver_00_example.c  ← ★ 通信逻辑 (主要修改对象)
-├── configs/            ← 平台配置文件
-└── makefile
-```
-
-### 3.3 Linux 端代码
-
-**位置**: 项目 `demo/` 目录
-
-| 文件 | 用途 |
-|------|------|
-| `sensor_receiver.c` | 传感器数据批量接收 (当前) |
-| `rpmsg-demo-single.c` | 基础回显测试 |
-
-**修改 Linux 逻辑** → 使用 `/dev/rpmsg_ctrl0` 创建端点，`/dev/rpmsg0` 收发数据。
-
-## 4. 编译方法
-
-### 4.1 FreeRTOS 固件编译 (当前)
-
-**前置**: standalone SDK 必须复制到 `freertos-sdk/standalone/` 目录下。
+## 6. 停止流程
 
 ```bash
-# 工具链
-export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
-
-# 进入目录
-cd /home/alientek/Phytium_syscode/phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux
-
-# 配置和编译
-make config_pe2204_phytiumpi_aarch64
-make clean && make all
-# 输出: pe2204_aarch64_phytiumpi_openamp_for_linux.elf
+# FreeRTOS从核 (rpmsg-echo_os.c)
+echo stop > /sys/class/remoteproc/remoteproc0/state
+  → shutdown_req = 1
+  → RpmsgEchoTask 退出循环
+  → rpmsg_destroy_ept()
+  → platform_cleanup()
+  → FPsciCpuOff()  → CPU3 下电
 ```
 
-**构建系统修复记录** (初次搭建需要):
-1. 复制 standalone SDK: `cp -r phytium-standalone-sdk-master/ freertos-sdk/standalone/`
-2. `Kconfig` 第22行: `source "$(SDK_DIR)/../freertos.kconfig"` → `source "$(FREERTOS_SDK_DIR)/freertos.kconfig"`
-3. `makefile` 第2行: 改为 `FREERTOS_SDK_DIR := $(abspath ...)` 并 `export`
-4. `tools/freertos_comonents.mk` 第2行: 改为 `$(abspath $(SDK_DIR)/..)`
+## 7. 关于 LoRa 模拟的说明
 
-### 4.2 Bare-metal 固件编译
+**当前状态**: LoRa模块未接入硬件，但可以通过RPMsg注入模拟数据验证全链路。
 
-```bash
-export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
+```
+【当前可验证路径】(无需LoRa模块)
+Linux master_receiver
+  → write(DEVICE_MASTER_DATA, simulated_lora_frame)
+    → RPMsg → FreeRTOS rpmsg_endpoint_cb()
+      → master_recv_inject_data() → master_recv处理管线
+        → parse_frame() → 帧解析
+          → 状态/波形数据 → 共享内存Flash
+          → 节点状态更新
+        → master_judge_task → 故障判决 → 命令入队
+        → master_cmd_task → 命令加密 → rpmsg_send_master_cmd()
+      → RPMsg → Linux master_receiver → print_master_cmd()
 
-cd /home/alientek/Phytium_syscode/phytium-standalone-sdk-master/phytium-standalone-sdk-master/example/system/amp/openamp_for_linux
-
-make config_pe2204_phytiumpi_aarch64
-make clean && make all
-# 输出: pe2204_aarch64_phytiumpi_openamp_core0.elf
+【待接入的完整路径】(需要LoRa模块)
+终端节点 → LoRa无线 → ATK-MWCC68D → UART3 → FreeRTOS/Linux
+  → master_recv → judge → cmd → Linux → LoRa → 终端节点
 ```
 
-### 4.3 Linux 程序编译
-
-```bash
-export CROSS_COMPILE="/home/alientek/Phytium_syscode/GCC编译器/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-"
-
-${CROSS_COMPILE}gcc -Wall -O2 -std=c11 -o sensor_receiver sensor_receiver.c
-```
-
-## 5. 部署和烧写
-
-### 5.1 从核固件部署
-
-```bash
-# 复制到开发板
-scp <firmware.elf> user@192.168.88.11:/tmp/openamp_core0.elf
-ssh user@192.168.88.11 "sudo cp /tmp/openamp_core0.elf /lib/firmware/"
-
-# 方法1: 重启从核 (FreeRTOS 可能不响应stop, 推荐重启系统)
-ssh user@192.168.88.11 "sudo reboot"
-
-# 方法2: 如果从核支持stop (bare-metal)
-ssh user@192.168.88.11 "
-  echo stop | sudo tee /sys/class/remoteproc/remoteproc0/state
-  sleep 1
-  echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
-"
-```
-
-### 5.2 Linux 程序部署
-
-```bash
-scp sensor_receiver user@192.168.88.11:~/
-ssh user@192.168.88.11 "chmod +x ~/sensor_receiver"
-```
-
-### 5.3 设备树修改 (需要时)
-
-设备树只有修改硬件资源（共享内存大小、中断号等）才需要更新。修改应用层代码**不需要更新设备树**。
-
-如果需要修改设备树，流程见 `docs/setup-guide.md`。
-
-## 6. 验证方法
-
-### 6.1 检查从核状态
-
-```bash
-ssh user@192.168.88.11 "cat /sys/class/remoteproc/remoteproc0/state"
-# running = 正常, offline = 未启动, crashed = 崩溃
-```
-
-### 6.2 检查 RPMsg 通道
-
-```bash
-ssh user@192.168.88.11 "ls /sys/bus/rpmsg/devices/"
-# 应看到: virtio0.rpmsg-openamp-demo-channel.-1.0
-```
-
-### 6.3 查看内核日志
-
-```bash
-ssh user@192.168.88.11 "dmesg | grep -iE 'rproc|rpmsg|virtio' | tail -20"
-```
-
-### 6.4 运行传感器测试 (当前主测试)
-
-```bash
-ssh -tt user@192.168.88.11 "
-  sudo modprobe rpmsg_char rpmsg_ctrl
-  echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
-  sleep 2
-  echo rpmsg_chrdev | sudo tee /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0/driver_override
-  echo virtio0.rpmsg-openamp-demo-channel.-1.0 | sudo tee /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
-  sudo chmod 666 /dev/rpmsg0 /dev/rpmsg_ctrl0
-  timeout 30 ~/sensor_receiver
-"
-```
-
-### 6.5 快速验证脚本
-
-```bash
-ssh user@192.168.88.11 '
-echo "=== remoteproc: $(cat /sys/class/remoteproc/remoteproc0/state) ==="
-echo "=== RPMsg channels ===" && ls /sys/bus/rpmsg/devices/ 2>/dev/null
-echo "=== /dev/rpmsg ===" && ls -la /dev/rpmsg* 2>/dev/null
-echo "=== dmesg last 5 ===" && dmesg | grep -iE "rproc|rpmsg" | tail -5
-'
-```
-
-## 7. 当前通信配置
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| 通道名 | `rpmsg-openamp-demo-channel` | 主核和从核必须一致 |
-| 从核 OS | FreeRTOS (RpmsgEchoTask, 8KB栈, 优先级4) | 也支持 bare-metal |
-| 从核地址 | `0` | RPMsg 目的地址 |
-| 主核地址 | `0xFFFFFFFF` (RPMSG_ADDR_ANY) | 自动分配 |
-| 共享内存基址 | `0xB0100000` | 物理地址 |
-| 共享内存大小 | `0x19900000` (409MB) | 固件代码 + vring + 数据缓冲 |
-| IPI 中断 | SGI 9 | GICv3 软件生成中断 |
-| 从核 CPU | CPU 3 (FTC664) | 由 Linux SMP 剥离 |
-| 传感器数据包 | 10包/批, 每2秒一批 | SensorPacket 结构体 (24字节) |
-
-## 8. 故障排查
-
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `/sys/class/remoteproc/` 为空 | 设备树无 OpenAMP 节点 | 确认 dtb 包含嵌套结构 `homo,rproc` + `homo,rproc-core` |
-| `OF: reserved mem:` 未打印 | 未用启动 dtb 直接修改 | 不要用 overlay，直接修改 boot dtb |
-| `cpuhp setup state failed -16` | CPU hotplug 状态残留 | 重启开发板 |
-| probe 成功但无设备 | 用了平铺结构 (5.10) | kernel 6.6 需嵌套 `homo,rproc-core` 子节点 |
-| state = running 但无通道 | FreeRTOS 固件崩溃 | 重启开发板重新加载固件 |
-| sensor只收1包 | `platform_poll` priv 指针错误 | FreeRTOS 需保存 remoteproc 结构体全局指针 |
-| `Permission denied` | 设备权限 | `chmod 666 /dev/rpmsg*` |
-| `remoteproc can't stop` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
-| 串口打印过多无法输入命令 | FreeRTOS 每批打印日志到UART1 | 已优化为每50批打印一次; 日常用SSH控制 |
-| `/dev/rpmsg` 设备过多(>100) | 多次启停面板未清理端点 | `sudo reboot`; 使用 `~/stop-openamp.sh` 正确停止 |
-
-## 9. 通信程序操作 (一键启动/停止)
-
-### 一键启动
-
-在开发板上直接运行:
-```bash
-~/start-openamp.sh
-```
-
-### 一键停止
-
-```bash
-~/stop-openamp.sh
-```
-
-脚本自动处理: 模块加载/卸载、从核启停、通道绑定、面板启动、资源清理。
-
-### 开机自启 (systemd)
-
-已配置 systemd 服务，**重启开发板后自动运行**，无需手动操作。
-
-```bash
-# 查看状态
-systemctl status openamp
-
-# 手动停止
-sudo systemctl stop openamp
-
-# 手动启动
-sudo systemctl start openamp
-
-# 重启服务
-sudo systemctl restart openamp
-```
-
-### 手动操作 (备选)
-
-
-
-### 启动流程 (完整序列, 已测试)
-
-主板重启后, 按以下顺序启动:
-
-```bash
-# Step 1: 加载内核模块
-sudo modprobe rpmsg_char rpmsg_ctrl
-
-# Step 2: 启动从核 (FreeRTOS)
-echo start | sudo tee /sys/class/remoteproc/remoteproc0/state
-sleep 2  # 等待从核启动
-
-# Step 3: 绑定 RPMsg 通道
-echo rpmsg_chrdev | sudo tee /sys/bus/rpmsg/devices/virtio0.rpmsg-openamp-demo-channel.-1.0/driver_override
-echo virtio0.rpmsg-openamp-demo-channel.-1.0 | sudo tee /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
-
-# Step 4: 设置设备权限
-sudo chmod 666 /dev/rpmsg0 /dev/rpmsg_ctrl0
-
-# Step 5: 启动监控面板
-nohup ~/dashboard_server > /tmp/dashboard.log 2>&1 &
-
-# Step 6 (可选): 启动生命周期管理器 (B1+B2+B3)
-nohup ~/lifecycle_mgr > /tmp/lifecycle.log 2>&1 &
-```
-
-### 验证通信正常
-
-```bash
-# 检查 rpmsg 设备数 (正常应为 2-5 个)
-ls /dev/rpmsg* | wc -l
-
-# 检查面板数据 (应为非零)
-curl -s http://localhost:8080/stats | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["batches"])'
-```
-
-### 停止流程 (完整序列)
-
-```bash
-# Step 1: 停止面板和生命周期管理器
-killall -9 dashboard_server lifecycle_mgr 2>/dev/null
-
-# Step 2: 停止从核
-echo stop | sudo tee /sys/class/remoteproc/remoteproc0/state
-
-# Step 3: 卸载模块 (注意顺序)
-sudo rmmod rpmsg_ctrl
-sudo rmmod rpmsg_char
-
-# Step 4: 验证清理
-ls /dev/rpmsg*          # 应无输出
-```
-
-### 仅重启面板 (不重启从核)
-
-如果只是修改了面板代码, **不需要重启从核**, 只需要:
-
-```bash
-killall -9 dashboard_server
-# 复制新面板程序后:
-nohup ~/dashboard_server > /tmp/dashboard.log 2>&1 &
-```
-
-### 重新部署固件后
-
-如果修改了 FreeRTOS/bare-metal 固件, **必须重启系统**:
-
-```bash
-scp new_firmware.elf user@192.168.88.11:/tmp/openamp_core0.elf
-ssh user@192.168.88.11 "sudo cp /tmp/openamp_core0.elf /lib/firmware/ && sudo reboot"
-```
-
-### 常见问题: /dev/rpmsg 设备数过多
-
-**现象**: `ls /dev/rpmsg* | wc -l` 超过 100, 面板数据显示 0 批次。
-
-**原因**: 多次启动 dashboard_server 或 lifecycle_mgr 而不清理, 每次创建新的 RPMsg 端点但不释放旧的。
-
-**解决**: `sudo reboot` 重启系统。**不要在短时间内反复启停面板程序。**
-
-## 10. 优化记录
-
-详见 [optimization-record.md](optimization-record.md)
-
-| 优化 | 效果 |
-|------|------|
-| A1 批量合并 | 延迟 19.79ms→0.03ms (659×) |
-| C2 边缘检测 | FreeRTOS 阈值预判, 21次告警/70包 |
-| C3 Web面板 | 实时监控面板 http://192.168.88.11:8080 |
-| `remoteproc can't stop rproc: -1` | FreeRTOS 不响应 stop | `sudo reboot` 重启开发板 |
+## 8. 异核通信实现位置
+
+| 层 | 位置 | 说明 |
+|-----|------|------|
+| FreeRTOS 应用层 | [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c) | `rpmsg_send()`, `rpmsg_endpoint_cb()`, `platform_poll()` |
+| FreeRTOS OpenAMP库 | SDK内置 | `rpmsg_create_ept()`, `rpmsg_send()`, `platform_create_proc()` |
+| 共享内存初始化 | [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c) (资源表) + 设备树 | vring地址、大小定义 |
+| Linux 内核驱动 | `drivers/remoteproc/homo_remoteproc.c` (飞腾定制) | `homo_rproc_kick()` 写GICv3 SGI寄存器 |
+| Linux 应用层 | [src/openamp-demo/linux-master/master_receiver.c](file:///home/alientek/Phytium/src/openamp-demo/linux-master/master_receiver.c) | `/dev/rpmsg0` read/write |
+
+**通道数量**: 1个 (`rpmsg-openamp-demo-channel`)，双向复用，通过command字段区分消息。

@@ -1,5 +1,9 @@
 # 调试日志
 
+> **更新**: 2026-05-18 | **当前架构**: Linux主核 + FreeRTOS从核 (GD32主控移植版)
+>
+> 本文件记录历史调试问题和解决方案，是项目演进过程的客观记录。当前架构和通信流程见 [architecture.md](architecture.md) 和 [communication-flow.md](communication-flow.md)。
+
 ## 2026-05-11: OpenAMP 异构多核通信打通
 
 ### 问题 1: 设备树 Overlay 无法使能 OpenAMP

@@ -1,17 +1,17 @@
 # OpenAMP 异构多核通信知识库
 
-> **项目进度**: 设备树已配置 → Bare-metal/FreeRTOS双版本 → A1批量合并(659×加速) → C2边缘异常检测 → C3 Web面板 → **GD32主控移植完成** → [移植记录](transplant-gd32-to-phytium.md) → 优化记录: [optimization-record.md](optimization-record.md)
+> **更新**: 2026-05-18 | **项目进度**: 设备树配置完成 → Bare-metal/FreeRTOS 双版本 → A1-A4 性能优化 → C2 边缘检测 → C3 Web面板 → **GD32主控移植完成** → [GD32移植记录](transplant-gd32-to-phytium.md)
 
 ## 1. 硬件架构
 
 ### SoC: Phytium PE2204
 
-| CPU | 核心类型 | Device Tree | 逻辑 CPU | MPIDR | 用途 |
-|-----|---------|-------------|---------|-------|------|
-| cpu@0 | FTC664 (big) | cpu_b0 | cpu0 | 0x000 | Linux SMP |
-| cpu@1 | FTC664 (big) | cpu_b1 | cpu1 | 0x100 | Linux SMP |
-| cpu@100 | FTC310 (LITTLE) | cpu_l0 | cpu2 | 0x200 | Linux SMP |
-| cpu@101 | FTC310 (LITTLE) | cpu_l1 | cpu3 | 0x201 | **OpenAMP 从核** |
+| CPU | 核心类型 | MPIDR | 逻辑CPU | 用途 |
+|-----|---------|-------|---------|------|
+| cpu@0 | FTC310 (LITTLE) | 0x200 | cpu0 | Linux SMP |
+| cpu@1 | FTC310 (LITTLE) | 0x201 | cpu1 | Linux SMP |
+| cpu@2 | FTC664 (big) | 0x000 | cpu2 | Linux SMP |
+| cpu@3 | FTC664 (big) | 0x100 | cpu3 | **FreeRTOS 从核 (OpenAMP 独占)** |
 
 ### 内存布局
 
@@ -20,7 +20,7 @@
 | 0x80000000 - 0x80010000 | 64KB | 启动保留 (/memreserve/) |
 | 0x80010000 - 0xB0100000 | ~768MB | Linux 可用 |
 | **0xB0100000 - 0xC9A00000** | **409MB** | **OpenAMP 共享内存 (reserved-memory, no-map)** |
-| 0xC9A00000 - 0x??? | ~3GB | Linux 可用 |
+| 0xC9A00000+ | ~3GB | Linux 可用 |
 
 ## 2. 设备树配置 (Kernel 6.6)
 
@@ -45,25 +45,25 @@
         status = "okay";
         homo_core0: homo_core0@b0100000 {
             compatible = "homo,rproc-core";
-            remote-processor = <3>;        // CPU 3 (cpu_l1, FTC310)
-            inter-processor-interrupt = <9>; // SGI 9 (8-15 可用, 0-7 内核保留)
-            memory-region = <&rproc>;       // 指向共享内存
+            remote-processor = <3>;         // CPU 3 (FTC664)
+            inter-processor-interrupt = <9>; // SGI 9 (8-15可用, 0-7内核保留)
+            memory-region = <&rproc>;
             firmware-name = "openamp_core0.elf";
         };
     };
 };
 ```
 
-### 关键 DT 属性说明
+## 3. 关键 DT 属性
 
 | 属性 | 值 | 说明 |
 |------|-----|------|
 | `remote-processor` | `<3>` | Linux 逻辑 CPU 号 |
-| `inter-processor-interrupt` | `<9>` | GICv3 SGI 中断号 (8-15 范围，0-7 被内核 SMP 保留) |
+| `inter-processor-interrupt` | `<9>` | GICv3 SGI 中断号 (8-15范围) |
 | `memory-region` | `<&rproc>` | phandle 指向 reserved-memory 节点 |
 | `firmware-name` | `"openamp_core0.elf"` | 必须在 /lib/firmware/ 下 |
 
-## 3. 内核配置
+## 4. 内核配置
 
 ```makefile
 CONFIG_REMOTEPROC=y
@@ -76,9 +76,7 @@ CONFIG_RPMSG_VIRTIO=y          # VirtIO RPMsg 传输
 CONFIG_PHYTIUM_MBOX=y          # Phytium 邮箱驱动
 ```
 
-## 4. 驱动架构
-
-### homo_remoteproc 驱动流程
+## 5. OpenAMP 驱动启动流程
 
 ```
 homo_rproc_probe()
@@ -91,117 +89,83 @@ homo_rproc_probe()
   ├── request_percpu_irq()         → 注册 SGI IPI 中断
   ├── cpuhp_setup_state()          → CPU hotplug 回调
   ├── homo_core_of_init()          → 解析子节点 "homo,rproc-core"
-  └── rproc_add()                  → 注册 remoteproc 设备 → /sys/class/remoteproc/remoteproc0
+  └── rproc_add()                  → 注册 remoteproc 设备
 
 homo_rproc_start() (echo start > state)
   ├── remove_cpu(3)                → 下电 CPU3
-  ├── arm_smccc_smc(CPU_ON, ...)   → PSCI 启动 CPU3，入口 0xB0100000
+  ├── 加载 openamp_core0.elf 到 0xB0100000
+  ├── arm_smccc_smc(CPU_ON, ...)   → PSCI 启动 CPU3
   └── rproc_virtio → virtio_rpmsg_bus → 创建 RPMsg 通道
-
-homo_rproc_kick() (发送 IPI)
-  └── gic_write_sgi1r(ipi=9, target=CPU3_MPIDR)  → GICv3 直接寄存器写入
 ```
 
-## 5. 从核固件编译
+## 6. FreeRTOS 从核编译
 
-### 工具链
+### 6.1 工具链
 
 - **必须**: `aarch64-none-elf-gcc` (ARM bare-metal, 非 Linux 版本)
-- **工具链路径**: `/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/`
+- **路径**: `/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/`
 
-### 5.1 Bare-metal SDK: phytium-standalone-sdk
+### 6.2 FreeRTOS SDK: phytium-free-rtos-sdk
 
-```bash
-export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
-cd phytium-standalone-sdk-master/example/system/amp/openamp_for_linux/
-make config_pe2204_phytiumpi_aarch64
-make clean && make all
-# 输出: pe2204_aarch64_phytiumpi_openamp_core0.elf
-```
-
-### 5.2 FreeRTOS SDK: phytium-free-rtos-sdk
-
-**前置条件**: 必须将 standalone SDK 复制到 `freertos-sdk/standalone/` 目录下。
+**前置**: standalone SDK 已复制到 `freertos-sdk/standalone/` 目录下。
 
 ```bash
 export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
-cd phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux/
+
+cd /home/alientek/Phytium_syscode/phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux
+
 make config_pe2204_phytiumpi_aarch64
 make clean && make all
 # 输出: pe2204_aarch64_phytiumpi_openamp_for_linux.elf
 ```
 
-**FreeRTOS 架构**: `main.c` 创建 FreeRTOS 任务 `RpmsgEchoTask`（`rpmsg-echo_os.c`），堆栈 8KB，优先级 4，通过 `vTaskStartScheduler` 启动调度器。
+### 6.3 FreeRTOS 项目代码结构 (本项目的移植代码)
 
-**与 bare-metal 的关键差异**:
-- 使用 `FreeRTOS.h` + `task.h` 任务管理
-- `platform_poll` 需要 remoteproc 结构体指针（不可用回调 priv）
-- Stop 机制不同：需通过 `shutdown_req` + `rproc_get_stop_flag()` 退出任务
-- 源文件: `src/rpmsg-echo_os.c` (非 `slaver_00_example.c`)
-
-### 固件配置要点 (通用)
-
-- 加载地址: `0xB0100000` (CONFIG_IMAGE_LOAD_ADDRESS)
-- 中断角色: slave (CONFIG_INTERRUPT_ROLE_SLAVE=y)
-- 使用 IPI 中断: CONFIG_USE_OPENAMP_IPI=y
-- 启用 Cache 一致性: CONFIG_USE_CACHE_COHERENCY=y
-
-## 6. FIT Image 修改流程
-
-### mmc 布局
-
-| 偏移 | 大小 | 内容 |
-|------|------|------|
-| 0 - 4MB | 4MB | fip-all.bin (U-Boot + ATF) |
-| 4MB - 64MB | 60MB | fitImage (kernel.gz + dtb) |
-| 64MB+ (sector 131072) | 29.2GB | ext4 rootfs |
-
-### 更新 fitImage
-
-```bash
-# 方法1: 工具脚本 (推荐)
-sudo runtime_replace_bootloader.sh fitImage  # 需要 fitImage 在当前目录
-
-# 方法2: 手动 dd
-sudo dd if=new_fitImage of=/dev/mmcblk0 bs=1M seek=4 count=60
+```
+phytium-free-rtos-sdk-master/example/system/amp/openamp_for_linux/
+├── main.c              ← FreeRTOS 入口 (chaos_init → master_init → task_create → scheduler)
+├── src/
+│   ├── rpmsg-echo_os.c ← ★ RPMsg通信核心 + 边缘检测
+│   ├── master_recv.c   ← LoRa帧接收/解析
+│   ├── master_judge.c  ← 故障判决
+│   ├── master_cmd.c    ← 命令生成/加密/发送
+│   ├── master_sys.c    ← 节点管理/Flash模拟
+│   ├── chaos_encrypt.c ← 混沌加解密
+│   └── log.c           ← 日志
+├── inc/
+│   ├── master.h        ← 主控数据结构/宏定义
+│   ├── data_frame.h    ← LoRa帧数据结构
+│   ├── chaos_encrypt.h ← 混沌加密接口
+│   └── log.h           ← 日志接口
+├── configs/            ← 平台配置文件
+└── makefile            ← 构建
 ```
 
-### 打包新 fitImage
+### 6.4 Bare-metal SDK (备用)
 
 ```bash
-# 1. 创建 .its 文件
-cat > new_fit.its << EOF
-/dts-v1/;
-/ {
-    description = "U-Boot fitImage for Phytium Phytiumpi";
-    #address-cells = <1>;
-    images {
-        kernel { ... };
-        fdt-phytium { ... };
-    };
-    configurations {
-        default = "phytium";
-        phytium { kernel = "kernel"; fdt = "fdt-phytium"; };
-    };
-};
-EOF
+export AARCH64_CROSS_PATH="/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf"
 
-# 2. 用 mkimage 打包
-mkimage -f new_fit.its new_fitImage
+cd /home/alientek/Phytium_syscode/phytium-standalone-sdk-master/example/system/amp/openamp_for_linux
+
+make config_pe2204_phytiumpi_aarch64
+make clean && make all
+# 输出: pe2204_aarch64_phytiumpi_openamp_core0.elf
 ```
 
 ## 7. RPMsg 通信操作
 
-### 启动序列
+### 7.1 启动序列
 
 ```bash
 modprobe rpmsg_char rpmsg_ctrl                          # 加载模块
 echo start > /sys/class/remoteproc/remoteproc0/state    # 启动从核
 echo rpmsg_chrdev > .../driver_override                  # 绑定驱动
 echo virtio0.rpmsg-openamp-demo-channel.-1.0 > .../bind # 创建设备
+sudo chmod 666 /dev/rpmsg*                              # 设置权限
 ```
 
-### 验证检查
+### 7.2 验证命令
 
 ```bash
 cat /sys/class/remoteproc/remoteproc0/state  # running/offline
@@ -210,32 +174,47 @@ ls /dev/rpmsg*                               # rpmsg0, rpmsg_ctrl0
 dmesg | grep -i rproc                        # 启动日志
 ```
 
-### 停止序列
+### 7.3 停止序列
 
 ```bash
 echo stop > /sys/class/remoteproc/remoteproc0/state
 modprobe -r rpmsg_char rpmsg_ctrl
 ```
 
-## 8. 关键路径和文件
+## 8. 固件配置要点
 
-| 文件 | 位置 |
-|------|------|
-| 内核源码 (5.10) | `/home/alientek/Phytium_syscode/内核源码/` |
-| 裸机 SDK | `/home/alientek/Phytium_syscode/phytium-standalone-sdk-master/` |
-| FreeRTOS SDK | `/home/alientek/Phytium_syscode/phytium-free-rtos-sdk-master/` |
-| 裸机编译器 | `/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/` |
-| Linux 编译器 | `/home/alientek/Phytium_syscode/GCC编译器/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/` |
-| 手册和文档 | `/home/alientek/phytium-embedded-docs-master/` |
-| PIOS 镜像 | `/home/alientek/Phytium_syscode/PIOS2.2镜像/` |
+- 加载地址: `0xB0100000` (CONFIG_IMAGE_LOAD_ADDRESS)
+- 中断角色: slave (CONFIG_INTERRUPT_ROLE_SLAVE=y)
+- 使用 IPI 中断: CONFIG_USE_OPENAMP_IPI=y
+- 启用 Cache 一致性: CONFIG_USE_CACHE_COHERENCY=y
 
-## 9. 常见问题速查
+## 9. 题排查表
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `/sys/class/remoteproc/` 为空 | 设备树无 OpenAMP 节点 | 确认 dtb 包含嵌套结构 |
-| `OF: reserved mem:` 未打印 | 未用启动 dtb 直接修改 | 不要用 overlay，直接修改 dtb |
-| `cpuhp setup state failed -16` | cpu hotplug 状态残留 | 重启开发板 |
-| probe 成功但无设备 | 用了平铺结构 | 改用嵌套 `homo,rproc-core` 子节点 |
-| `Permission denied` 打开 rpmsg | 设备权限 | `chmod 666 /dev/rpmsg*` |
-| 固件加载后崩溃 | 固件编译架构不匹配 | 确认 `aarch64-none-elf` 编译 |
+| `OF: reserved mem:` 未打印 | 未用启动 dtb 修改 | 直接修改 dtb，不用 overlay |
+| probe 成功但无设备 | 用了平铺结构 | 改用嵌套 `homo,rproc-core` |
+| `Permission denied` | 设备权限 | `chmod 666 /dev/rpmsg*` |
+| 固件崩溃 | 编译架构不匹配 | 确认 `aarch64-none-elf` 编译 |
+| FreeRTOS sensor 只发1包 | remoteproc priv 丢失 | 使用全局 `g_remoteproc_priv` |
+
+## 10. 关键路径速查
+
+| 文件 | 位置 |
+|------|------|
+| FreeRTOS项目代码 | `/home/alientek/Phytium/freertos/` |
+| FreeRTOS SDK | `/home/alientek/Phytium_syscode/phytium-free-rtos-sdk-master/` |
+| Bare-metal SDK | `/home/alientek/Phytium_syscode/phytium-standalone-sdk-master/` |
+| FreeRTOS 编译器 | `/home/alientek/Phytium_syscode/GCC编译器/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/` |
+| Linux 编译器 | `/home/alientek/Phytium_syscode/GCC编译器/gcc-arm-10.2-2020.11-x86_64-aarch64-none-linux-gnu/` |
+| 内核源码 (5.10) | `/home/alientek/Phytium_syscode/内核源码/` |
+| 飞腾参考文档 | `/home/alientek/phytium-embedded-docs-master/` |
+| Linux 应用 | `/home/alientek/Phytium/src/openamp-demo/` |
+| GD32 原始工程 | `/home/alientek/Phytium/GD32L233C_Prj_Master/` |
+
+## 11. 参考链接
+
+- 飞腾嵌入式文档: https://gitee.com/phytium_embedded/phytium-embedded-docs
+- OpenAMP 手册: https://gitee.com/phytium_embedded/phytium-embedded-docs/tree/master/open-amp
+- OpenAMP 官方: https://www.openampproject.org/
