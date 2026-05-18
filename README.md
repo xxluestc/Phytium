@@ -2,7 +2,7 @@
 
 在飞腾派 CEK8903 开发板上实现 **异构多核 LoRa 主控系统**：Linux 主核 (CPU0-2) 负责数据接收/转发，FreeRTOS 从核 (CPU3) 负责 LoRa 帧处理/故障判决/命令生成，通过 OpenAMP/RPMsg 进行核间通信。
 
-> **当前状态**: GD32 代码已全部移植到 FreeRTOS 从核，LoRa 模块待接入硬件验证。可通过 RPMsg 注入模拟数据验证全链路。
+> **当前状态**: GD32 代码已全部移植到 FreeRTOS 从核。LoRa 模块通过 UART 直连 **FreeRTOS CPU3 侧** (Linux 不直接操作 LoRa)。当前使用 `master_sim_lora_data()` 仿真器自驱动验证全链路，无需 LoRa 硬件。接入真实模块时只需切换 `USE_LORA_SIMULATION` 宏。
 
 ## 项目文档导航
 
@@ -124,7 +124,7 @@ Linux主核 (CPU0-2)                   FreeRTOS从核 (CPU3)
 **关键答案**:
 - **异核通信**: 共享内存 + GICv3 SGI 9 中断，实现位置在 `rpmsg-echo_os.c` (FreeRTOS侧) 和内核 `homo_remoteproc` 驱动 (Linux侧)
 - **通道数量**: **1个** RPMsg 通道 (`rpmsg-openamp-demo-channel`)，双向复用，通过 `command` 字段区分消息类型
-- **LoRa数据**: 当前为 stub 模式，可通过 RPMsg `DEVICE_MASTER_DATA` (0x0020) 注入模拟数据验证全链路
+- **LoRa数据**: 当前使用 `master_sim_lora_data()` 仿真器自驱动验证全链路。LoRa 模块直连 FreeRTOS CPU3 侧 UART，Linux 不直接操作 LoRa。接入真实硬件时切换 `USE_LORA_SIMULATION` 宏为 `0`，在 `master_lora_uart_recv()` 填入 UART 驱动。
 
 ## 开发资源
 
@@ -149,4 +149,4 @@ MIT License
 
 ---
 
-**版本**: v3.0 | **更新**: 2026-05-18 | **状态**: GD32代码移植完成，LoRa模块待接入
+**版本**: v3.0 | **更新**: 2026-05-18 | **状态**: GD32代码移植完成，LoRa仿真器自驱动运行，真实UART接口预留

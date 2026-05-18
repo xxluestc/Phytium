@@ -39,15 +39,29 @@
 
 ### 第1步: 数据到达 FreeRTOS 从核
 
-**数据来源(主方案)**:
+**数据来源**:
+
+LoRa 模块通过 UART 连接到 **FreeRTOS CPU3 侧**，Linux 不直接操作 LoRa。数据由 `master_recv_lora_data()` 统一入口获取，通过 `USE_LORA_SIMULATION` 宏一键切换仿真/真实硬件：
+
+```c
+#define USE_LORA_SIMULATION  1     /* 1=仿真模式, 0=真实LoRa UART */
+```
 
 | 方式 | 函数 | 文件 | 状态 |
 |------|------|------|------|
-| **数据模拟器 (推荐)** | `master_sim_lora_data()` → `master_recv_lora_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **已实现 (自驱动)** |
-| 物理LoRa模块 | `master_recv_lora_data()` (替换) | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | 待接入硬件 |
-| RPMsg注入 | `master_recv_inject_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | 可用 (备选) |
+| **数据模拟器 (当前)** | `master_sim_lora_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **已实现 (自驱动)** |
+| **真实LoRa UART (预留)** | `master_lora_uart_recv()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **预留接口，待填入UART驱动** |
+| RPMsg注入 (备选) | `master_recv_inject_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | 可用 |
 
-**数据模拟器路径** (当前可验证, 无需任何外部依赖):
+**接口层调用关系**:
+```
+master_recv_lora_data(buf, max_len)          ← 统一入口
+  ├─ USE_LORA_SIMULATION=1 → master_sim_lora_data()      ← 当前使用
+  └─ USE_LORA_SIMULATION=0 → master_lora_uart_recv()     ← 预留硬件接口
+       → 从 UART RX 环形缓冲区提取完整帧 (0xAA55...CRC8...0x55AA)
+```
+
+**数据模拟器路径** (当前可验证, 无需任何外部依赖, 上电自动运行):
 ```
 master_recv_task (每10ms循环)
   → master_recv_lora_data(raw_buf, 270)
@@ -63,10 +77,18 @@ master_recv_task (每10ms循环)
       → process_node_raw()       (累积采样点)
 ```
 
-**物理LoRa模块连接**:
-LoRa模块(UART)逻辑上连接到 **FreeRTOS CPU3 侧**，因为主控管线(master_recv → master_judge → master_cmd)全部运行在FreeRTOS侧。物理上PE2204所有CPU核均可访问UART3寄存器，推荐FreeRTOS直接驱动以消除RPMsg转发的延迟。
+**真实LoRa UART预留接口** (`master_lora_uart_recv`):
+```
+待接入步骤:
+  1. 将 USE_LORA_SIMULATION 改为 0
+  2. 在 master_lora_uart_recv() 中实现:
+     - UART3 初始化 (9600 baud, 8N1)
+     - RX 中断/DMA → ring_buf[2048]
+     - 帧头搜索 (0xAA 0x55) → LEN读取 → CRC8校验 → 返回一帧
+  3. 配合外设初始化: UART3时钟/GPIO复用(GPIO2_10/2_11)/中断配置
+```
 
-**RPMsg注入路径** (备选):
+**RPMsg注入路径** (备选, 用于调试):
 ```
 Linux (master_receiver.c)
   → write() → /dev/rpmsg0

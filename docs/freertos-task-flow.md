@@ -80,15 +80,29 @@ RpmsgEchoTask()
 | **源文件** | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) |
 | **功能** | LoRa帧接收、帧解析、数据分流存储 |
 
-**数据来源 (两种)**:
+**数据来源**:
 
-1. **物理LoRa模块** (当前 stub):
+LoRa 模块通过 UART 连接到 **FreeRTOS CPU3 侧**。`master_recv_lora_data()` 是统一入口，通过 `USE_LORA_SIMULATION` 宏切换仿真/真实硬件：
+
+```c
+#define USE_LORA_SIMULATION  1     /* 1=仿真模式, 0=真实LoRa UART */
+```
+
+1. **数据模拟器** (当前使用, `USE_LORA_SIMULATION=1`):
    ```c
-   master_recv_lora_data(buf, max_len) // 返回0，LoRa模块未接入
-   master_recv_lora_available()        // 返回0
+   master_recv_lora_data(buf, max_len)
+     → master_sim_lora_data(buf, max_len)   ← 状态机自动生成LoRa帧
    ```
+   模拟3个节点(过压/欠压/骤升)，上电自动运行，无需外部依赖。
 
-2. **RPMsg注入** (当前可用):
+2. **真实LoRa UART** (预留接口, `USE_LORA_SIMULATION=0`):
+   ```c
+   master_recv_lora_data(buf, max_len)
+     → master_lora_uart_recv(buf, max_len)  ← 从UART RX环形缓冲区取帧
+   ```
+   待接入: UART3初始化 → RX中断/DMA → ring_buf[2048] → 帧头搜索 → 出帧。
+
+3. **RPMsg注入** (备选, 用于调试):
    ```c
    master_recv_inject_data(data, len) // 通过RPMsg DEVICE_MASTER_DATA注入
    ```
@@ -272,8 +286,15 @@ send_lora_cmd(node_id, cmd_code, params, param_len)
 
 | 函数 | 状态 | 说明 |
 |------|------|------|
-| `master_recv_lora_data()` | **Stub (返回0)** | 原GD32通过USART1 DMA接收，移植后待LoRa模块接入 |
-| `master_recv_lora_available()` | **Stub (返回0)** | 检查LoRa是否有数据可读 |
-| `master_recv_inject_data()` | **可用** | 通过RPMsg DEVICE_MASTER_DATA注入模拟数据 |
+| `master_recv_lora_data()` | **统一入口** | 通过 `USE_LORA_SIMULATION` 宏分发到仿真或真实UART |
+| `master_sim_lora_data()` | **已实现** | 状态机自动生成LoRa帧，3节点轮转，上电自驱动运行 |
+| `master_lora_uart_recv()` | **预留接口** | 真实LoRa UART接收，待填入UART驱动代码 |
+| `master_recv_inject_data()` | **可用** | 通过RPMsg DEVICE_MASTER_DATA注入模拟数据(调试用途) |
 
-**结论**: 当前在**没有LoRa模块**的情况下，可以通过Linux侧向FreeRTOS发送RPMsg消息来验证整个数据处理链路。完整的帧解析、判决、命令发送管线都可以被测试。
+**切换方式**:
+```c
+// freertos/src/master_recv.c 第24行
+#define USE_LORA_SIMULATION  1     /* 1=仿真模式, 0=真实LoRa UART */
+```
+
+**结论**: 当前在**没有LoRa模块**的情况下，通过 `master_sim_lora_data()` 自驱动验证全链路。接入真实LoRa模块时只需将宏改为0并在 `master_lora_uart_recv()` 中实现UART接收逻辑。

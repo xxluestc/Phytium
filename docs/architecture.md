@@ -48,12 +48,22 @@
 │         └────────────────────────────────────────────────────────┘           │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │  外部接口 (待接入)                                                      │  │
+│  │  外部接口 — LoRa模块直连FreeRTOS                                        │  │
+│  │                                                                         │  │
 │  │  ┌──────────────────────┐     ┌──────────────────────┐                  │  │
-│  │  │ ATK-MWCC68D LoRa模块  │     │ 终端节点 (10个)      │                  │  │
-│  │  │ UART3 + GPIO2_10     │←───→│ 通过LoRa无线通信     │                  │  │
+│  │  │ ATK-MWCC68D LoRa模块  │←───→│ 终端节点 (10个)      │                  │  │
+│  │  │ UART3 + GPIO2_10     │无线  │ 通过LoRa无线通信     │                  │  │
 │  │  │ (连接飞腾派J1接口)   │     │                      │                  │  │
-│  │  └──────────────────────┘     └──────────────────────┘                  │  │
+│  │  └──────┬───────────────┘     └──────────────────────┘                  │  │
+│  │         │                                                               │  │
+│  │         │ UART3 RX/TX 直连 FreeRTOS CPU3                                │  │
+│  │         │ (Linux不直接操作LoRa，只通过RPMsg接收处理后的数据)              │  │
+│  │         ▼                                                               │  │
+│  │  ┌────────────────────────────────────────┐                              │  │
+│  │  │ FreeRTOS CPU3: master_recv_lora_data() │                              │  │
+│  │  │  ├─ USE_LORA_SIMULATION=1 → 仿真数据    │                              │  │
+│  │  │  └─ USE_LORA_SIMULATION=0 → UART驱动    │                              │  │
+│  │  └────────────────────────────────────────┘                              │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -82,15 +92,20 @@
 | └─ 0xB0120000               | 128KB     | 共享内存Flash模拟 (状态/波形数据)              |
 | 0xC9A00000+                 | \~3GB     | Linux 可用内存                         |
 
-### 2.3 外设引脚（LoRa模块，待接入）
+### 2.3 外设引脚（LoRa模块 → FreeRTOS CPU3）
 
-| 飞腾派接口     | PE2204引脚   | LoRa模块引脚     | 功能   |
-| --------- | ---------- | ------------ | ---- |
-| J1 Pin 8  | UART3\_TXD | LoRa RXD     | 数据发送 |
-| J1 Pin 10 | UART3\_RXD | LoRa TXD     | 数据接收 |
-| J1 Pin 7  | GPIO2\_10  | LoRa AUX/MD0 | 模式控制 |
+LoRa 模块通过 UART3 直连 **FreeRTOS CPU3 侧**，Linux 不直接操作 LoRa。
+
+| 飞腾派接口     | PE2204引脚   | LoRa模块引脚     | 功能   | 连接侧     |
+| --------- | ---------- | ------------ | ---- | -------- |
+| J1 Pin 8  | UART3\_TXD | LoRa RXD     | 数据发送 | FreeRTOS |
+| J1 Pin 10 | UART3\_RXD | LoRa TXD     | 数据接收 | FreeRTOS |
+| J1 Pin 7  | GPIO2\_10  | LoRa AUX/MD0 | 模式控制 | FreeRTOS |
 
 对应设备树: [lora-uart.dtso](file:///home/alientek/Phytium/device-tree/lora-uart.dtso)
+
+**当前模式**: `USE_LORA_SIMULATION=1` (仿真模式，无需硬件)
+**切换方式**: 将 [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) 中 `USE_LORA_SIMULATION` 改为 `0`，并在 `master_lora_uart_recv()` 中填入 UART 驱动代码。
 
 ## 3. 软件架构分层
 
@@ -156,19 +171,35 @@
 
 ## 5. LoRa数据现状
 
-### 关键结论：当前可以在没有LoRa模块的前提下验证整个链路
+### 5. LoRa数据现状
 
-| 问题                    | 答案                                                 |
-| --------------------- | -------------------------------------------------- |
-| FreeRTOS侧是否有LoRa真实数据？ | **没有**，`master_recv_lora_data()` 是stub，返回0         |
-| 数据从哪里来？               | Linux侧通过RPMsg `DEVICE_MASTER_DATA` 消息注入模拟数据        |
-| 能否验证整个链路？             | **可以**。数据链路：Linux模拟 → RPMsg → FreeRTOS处理 → RPMsg返回 |
+### 关键结论：当前通过仿真器自驱动验证全链路，无需LoRa硬件，无需Linux注入
 
-具体说明：
+| 问题 | 答案 |
+|------|------|
+| FreeRTOS侧是否有LoRa真实数据？ | **没有真实硬件数据**，但 `master_sim_lora_data()` 状态机自动生成仿真帧 |
+| 数据从哪里来？ | **FreeRTOS内部自生成** — 3节点轮转(过压/欠压/骤升)，上电自动运行 |
+| 能否验证整个链路？ | **可以**。数据链路：仿真器 → master_recv_task → 帧解析 → judge → cmd → RPMsg → Linux |
+| 如何接入真实LoRa？ | 将 `USE_LORA_SIMULATION` 改为 `0`，在 `master_lora_uart_recv()` 填入UART驱动 |
 
-- `master_recv_lora_data()` 原GD32通过USART1(DMA+中断)接收LoRa模块数据，移植后此函数为 stub 返回0
-- 通过 `master_recv_inject_data()` 函数，Linux可以将模拟的LoRa帧通过RPMsg注入到FreeRTOS的接收管线
-- FreeRTOS侧的帧解析、混沌解密、故障判决等完整管线都可以被验证
+**接口层结构**:
+```
+master_recv_lora_data(buf, max_len)          ← 统一入口
+  ├─ USE_LORA_SIMULATION=1 → master_sim_lora_data()      ← 当前: 状态机仿真
+  └─ USE_LORA_SIMULATION=0 → master_lora_uart_recv()     ← 预留: UART硬件接收
+       → 从 ring_buf[2048] 提取完整帧
+```
+
+**仿真器参数**:
+- 3个模拟节点 (node 0: 过压, node 1: 欠压, node 2: 电压骤升)
+- 每节点 80 个采样点 (2周期 × 40点/周期)
+- 每帧携带 10 个采样点，共 8 帧 + 1 帧头
+- 节点间等待 500ms (留给 judge 判决和 cmd 处理)
+
+**真实LoRa接入步骤**:
+1. 修改 `USE_LORA_SIMULATION` 为 `0`
+2. 实现 `master_lora_uart_recv()`: UART3初始化 → RX中断/DMA → 环形缓冲区 → 帧提取
+3. 配合外设初始化: UART3时钟/GPIO复用(GPIO2_10/2_11)/GIC中断配置
 
 详见: [通信流程详解](communication-flow.md)
 
@@ -240,13 +271,16 @@ Phytium/
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  第1步: 数据到达 FreeRTOS                                                 │
 │                                                                           │
-│  ┌──────────────────────┐      ┌──────────────────────────────────┐      │
-│  │ 外部LoRa帧 (待接入)   │ 或   │ Linux RPMsg DEVICE_MASTER_DATA     │      │
-│  │ master_recv_lora_data │      │ master_recv_inject_data()         │      │
-│  │ → stub: 返回0         │      │ → 注入到接收管线                  │      │
-│  └──────────┬───────────┘      └────────────────┬─────────────────┘      │
-│             └──────────────┬────────────────────┘                         │
-│                            ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │ LoRa数据源 (FreeRTOS CPU3侧):                                 │        │
+│  │  ├─ 仿真模式: master_sim_lora_data() ← 状态机自动生成帧       │        │
+│  │  ├─ 真实硬件: master_lora_uart_recv() ← UART3 RX 环形缓冲区   │        │
+│  │  └─ 调试注入: master_recv_inject_data() ← RPMsg (Linux侧)     │        │
+│  │                                                              │        │
+│  │ 统一入口: master_recv_lora_data()                            │        │
+│  │ 切换宏: USE_LORA_SIMULATION (1=仿真, 0=真实UART)             │        │
+│  └──────────────────────────┬───────────────────────────────────┘        │
+│                             ▼                                             │
 │  ┌──────────────────────────────────────────────────────────────┐        │
 │  │  master_recv_task (Prio=4)                                    │        │
 │  │  freertos/src/master_recv.c                                   │        │

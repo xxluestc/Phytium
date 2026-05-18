@@ -29,6 +29,8 @@ Phytium PE2204 异构四核
 ├── FreeRTOS 从核 (CPU3, 独占)
 │   ├── RpmsgEchoTask       ← OpenAMP/RPMsg 通信 (Prio=4)
 │   ├── master_recv_task    ← LoRa 帧接收/解析 (Prio=4)
+│   │   ├── 仿真模式: master_sim_lora_data()  ← 当前使用
+│   │   └── 真实硬件: master_lora_uart_recv()  ← 预留接口
 │   ├── master_judge_task   ← 故障判决 (Prio=5)
 │   └── master_cmd_task     ← 命令生成/发送 (Prio=3)
 │
@@ -37,8 +39,9 @@ Phytium PE2204 异构四核
 │   ├── 中断: GICv3 SGI 9
 │   └── 通道: rpmsg-openamp-demo-channel (1条双向)
 │
-└── 外部接口 (待接入)
-    └── ATK-MWCC68D LoRa 模块 ← UART3 + GPIO2_10
+└── 外部接口 — LoRa模块直连FreeRTOS
+    └── ATK-MWCC68D LoRa 模块 ← UART3 + GPIO2_10 → FreeRTOS CPU3
+        (Linux不直接操作LoRa，只通过RPMsg接收处理后的数据)
 ```
 
 > 详细架构见: [docs/architecture.md](docs/architecture.md)
@@ -52,7 +55,7 @@ Phytium PE2204 异构四核
 |------|------|
 | [freertos/main.c](freertos/main.c) | 系统入口，初始化 + 4个任务创建 |
 | [freertos/src/rpmsg-echo_os.c](freertos/src/rpmsg-echo_os.c) | ★ RPMsg通信核心，OpenAMP端点，批量发送，边缘检测 |
-| [freertos/src/master_recv.c](freertos/src/master_recv.c) | LoRa帧接收/解析管线，帧同步(0xAA55)/CRC8/数据分流 |
+| [freertos/src/master_recv.c](freertos/src/master_recv.c) | LoRa帧接收/解析管线，含 `USE_LORA_SIMULATION` 宏切换仿真/真实UART |
 | [freertos/src/master_judge.c](freertos/src/master_judge.c) | 故障判决，离线检测(15s超时)，波形请求生成 |
 | [freertos/src/master_cmd.c](freertos/src/master_cmd.c) | 命令加密/发送，混沌加密 + RPMsg转发 |
 | [freertos/src/master_sys.c](freertos/src/master_sys.c) | 节点管理，共享内存Flash模拟(状态区+波形区) |
