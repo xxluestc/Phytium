@@ -39,14 +39,34 @@
 
 ### 第1步: 数据到达 FreeRTOS 从核
 
-**数据来源(二选一)**:
+**数据来源(主方案)**:
 
 | 方式 | 函数 | 文件 | 状态 |
 |------|------|------|------|
-| 物理LoRa模块 | `master_recv_lora_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **Stub (返回0)** |
-| RPMsg注入 | `master_recv_inject_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **可用** |
+| **数据模拟器 (推荐)** | `master_sim_lora_data()` → `master_recv_lora_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | **已实现 (自驱动)** |
+| 物理LoRa模块 | `master_recv_lora_data()` (替换) | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | 待接入硬件 |
+| RPMsg注入 | `master_recv_inject_data()` | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | 可用 (备选) |
 
-**RPMsg注入路径** (当前可验证):
+**数据模拟器路径** (当前可验证, 无需任何外部依赖):
+```
+master_recv_task (每10ms循环)
+  → master_recv_lora_data(raw_buf, 270)
+    → master_sim_lora_data(buf, max_len)  ← ★ 内部状态机
+      Phase 0: 等待300ms (SIM_INIT_WAIT=30次×10ms)
+      Phase 1: 构造 FaultUploadHeader_t 帧 (SEVERITY_DANGER, FAULT_OVER_VOLTAGE)
+      Phase 2: 分批发送 80个 NodeSample_t (10个/帧, 共8帧)
+      Phase 3: 等待500ms (留给judge判决)
+      循环: 轮转 3个节点 (node 0/1/2, 不同故障类型)
+  → master_recv_inject_data(raw_buf, raw_len)  ← 复用注入管线
+    → parse_frame() → CRC8校验通过 → 按rx_type分流
+      → process_status_header()  (记录节点故障)
+      → process_node_raw()       (累积采样点)
+```
+
+**物理LoRa模块连接**:
+LoRa模块(UART)逻辑上连接到 **FreeRTOS CPU3 侧**，因为主控管线(master_recv → master_judge → master_cmd)全部运行在FreeRTOS侧。物理上PE2204所有CPU核均可访问UART3寄存器，推荐FreeRTOS直接驱动以消除RPMsg转发的延迟。
+
+**RPMsg注入路径** (备选):
 ```
 Linux (master_receiver.c)
   → write() → /dev/rpmsg0
@@ -241,7 +261,7 @@ master_receiver
 
 | 环节 | 步骤 | 文件路径 | 核心函数 |
 |------|------|---------|---------|
-| 数据到达 | 1 | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | `master_recv_lora_data()` / `master_recv_inject_data()` |
+| 数据到达 | 1 | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | `master_sim_lora_data()` → `master_recv_lora_data()` (自驱动模拟) / `master_recv_inject_data()` (RPMsg注入) |
 | RPMsg接收 | 1 | [freertos/src/rpmsg-echo_os.c](file:///home/alientek/Phytium/freertos/src/rpmsg-echo_os.c) | `rpmsg_endpoint_cb()` → `DEVICE_MASTER_DATA` |
 | 帧解析 | 2 | [freertos/src/master_recv.c](file:///home/alientek/Phytium/freertos/src/master_recv.c) | `parse_frame()` → CRC8 + 数据分流 |
 | 数据结构 | 2 | [freertos/inc/data_frame.h](file:///home/alientek/Phytium/freertos/inc/data_frame.h) | `NodeSample_t`, `FaultUploadHeader_t` 等 |
@@ -306,27 +326,70 @@ echo stop > /sys/class/remoteproc/remoteproc0/state
 
 ## 7. 关于 LoRa 模拟的说明
 
-**当前状态**: LoRa模块未接入硬件，但可以通过RPMsg注入模拟数据验证全链路。
+**当前状态**: LoRa模块未接入硬件，但通过 `master_sim_lora_data()` 可自驱动验证全链路。
 
 ```
-【当前可验证路径】(无需LoRa模块)
-Linux master_receiver
-  → write(DEVICE_MASTER_DATA, simulated_lora_frame)
-    → RPMsg → FreeRTOS rpmsg_endpoint_cb()
-      → master_recv_inject_data() → master_recv处理管线
-        → parse_frame() → 帧解析
-          → 状态/波形数据 → 共享内存Flash
-          → 节点状态更新
-        → master_judge_task → 故障判决 → 命令入队
-        → master_cmd_task → 命令加密 → rpmsg_send_master_cmd()
-      → RPMsg → Linux master_receiver → print_master_cmd()
+【当前可验证路径】(无需LoRa模块, 无需Linux注入, 上电自动运行)
+master_sim_lora_data() ← 状态机自动生成帧
+  → master_recv_lora_data() → master_recv_task 获取
+    → master_recv_inject_data() → 复用完整注入管线
+      → parse_frame() → CRC8校验 → 帧解析
+        → process_status_header()  [节点0: FAULT_OVER_VOLTAGE, DANGER]
+        → process_node_raw()       [80个NodeSample_t → 共享内存Flash]
+      → master_judge_task (1s) → 检测到DANGER → xQueueSend(MASTER_CMD_REQ_WAVE)
+      → master_cmd_task → send_lora_cmd()
+        → chaos_encrypt_packet() 加密命令
+        → rpmsg_send_master_cmd() → RPMsg明文 → Linux
+          → master_receiver.c: "[CMD] node=0 cmd=REQ_WAVE(0x10)"
+  循环: node 0(过压) → node 1(欠压) → node 2(骤升) → node 0...
 
-【待接入的完整路径】(需要LoRa模块)
-终端节点 → LoRa无线 → ATK-MWCC68D → UART3 → FreeRTOS/Linux
-  → master_recv → judge → cmd → Linux → LoRa → 终端节点
+【物理LoRa完整路径】(需要LoRa模块)
+终端节点 → LoRa无线 → ATK-MWCC68D → UART3 → FreeRTOS
+  → master_recv → judge → cmd → chaos_encrypt → LoRa TX → 终端节点
 ```
 
-## 8. 异核通信实现位置
+## 8. 混沌加密安全边界
+
+**加密区域** = LoRa空中无线链路 (对抗电磁监听、重放攻击)
+
+```
+                            ┌──────────────┐
+                            │  密文传输     │
+                            │  [sync][cipher│
+                            │   text...]    │
+                            └──┬────────┬──┘
+                  ┌────────────▼┐      ┌▼────────────┐
+                  │  主控下发    │      │  节点上报    │
+                  │ LoRa TX     │      │ LoRa RX     │
+                  └──────┬──────┘      └──────┬──────┘
+                         │                    │
+         ┌───────────────▼── FreeRTOS ────────▼───────────┐
+         │ 1. 加密命令下发:                                │
+         │    master_cmd_task → send_lora_cmd()             │
+         │    → chaos_encrypt_packet() → LoRa TX            │
+         │                                                 │
+         │ 2. 解密数据接收:                                │
+         │    LoRa RX → chaos_decrypt_packet(sync_code)     │
+         │    → process_status_header/process_node_raw()   │
+         │                                                 │
+         │ 3. ★ RPMsg 明文 (不经过LoRa空间, 无需加密)     │
+         │    rpmsg_send_master_data(plaintext)             │
+         │    rpmsg_send_master_cmd(plaintext)              │
+         └──────────────┬─ RPMsg 明文 ──────────────────────┘
+                        │
+         ┌──────────────▼── Linux (CPU0-2) ───────────────┐
+         │  master_receiver.c:                              │
+         │    → handle_master_data(raw)  // 明文payload      │
+         │    → handle_master_cmd(raw)   // 明文cmd参数      │
+         └─────────────────────────────────────────────────┘
+```
+
+**设计原则**: FreeRTOS侧是加密/解密的唯一入口。
+- 命令**生成**在 FreeRTOS 侧 (master_judge_task 判决后自动生成，不依赖Linux)
+- 命令**加密**在 FreeRTOS 侧 (send_lora_cmd → chaos_encrypt_packet)
+- RPMsg 明文副本仅供 Linux 监控/日志/UI，Linux 不参与决策闭环
+
+## 9. 异核通信实现位置
 
 | 层 | 位置 | 说明 |
 |-----|------|------|

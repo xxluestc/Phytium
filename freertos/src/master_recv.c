@@ -12,32 +12,273 @@
 #define FRAME_END_1         0xAA
 #define MAX_FRAME_BUF       270
 
-/*
- * master_recv_lora_data: 从LoRa获取原始帧数据的接口
+static uint8_t calc_frame_crc8(const uint8_t *data, uint16_t len);
+
+/* ==========================================================================
+ *  LoRa 接收接口层 — 仿真与真实硬件切换
  *
- * 移植说明:
- *   原GD32通过 USART1 (中断+DMA) 接收LoRa模块数据。
- *   移植到飞腾派后，LoRa模块通过UART连接到PE2204。
- *   当前LoRa模块未接，此函数为stub，返回0。
- *   后续接入LoRa模块后，需要实现:
- *     1. FreeRTOS侧初始化对应UART
- *     2. 配置UART接收中断/DMA
- *     3. 将接收到的数据放入环形缓冲区
- *     4. 此函数从缓冲区读取数据
+ *  LoRa 模块通过 UART 连接到 FreeRTOS CPU3 侧，Linux 不直接操作 LoRa。
+ *  当前用仿真函数自驱动验证全链路；接入真实硬件后切换宏定义即可。
+ * ========================================================================== */
+
+#define USE_LORA_SIMULATION  1     /* 1=仿真模式, 0=真实LoRa UART */
+
+static uint16_t master_sim_lora_data(uint8_t *buf, uint16_t max_len);
+static uint16_t master_lora_uart_recv(uint8_t *buf, uint16_t max_len);
+
+/*
+ * master_recv_lora_data: 从LoRa获取原始帧数据的统一入口
+ *
+ *  仿真模式 (USE_LORA_SIMULATION=1):
+ *    调用 master_sim_lora_data() — 状态机生成 LoRa帧(明文),
+ *    注入 master_recv_inject_data 管线, 全链路自驱动验证。
+ *
+ *  真实硬件 (USE_LORA_SIMULATION=0):
+ *    调用 master_lora_uart_recv() — 从UART环形缓冲区取原始字节,
+ *    交给后续 parse_frame() 处理。
  */
 static uint16_t master_recv_lora_data(uint8_t *buf, uint16_t max_len)
 {
+#if USE_LORA_SIMULATION
+    return master_sim_lora_data(buf, max_len);
+#else
+    return master_lora_uart_recv(buf, max_len);
+#endif
+}
+
+/* ==========================================================================
+ *  真实 LoRa UART 接收 — 后续接入硬件时在此实现
+ *
+ *  接入步骤:
+ *    1. 初始化 PE2204 的 UART3 (或其它UART):
+ *       master_lora_uart_init(baud, parity, stop_bits)
+ *       配置 GPIO 复用 (TX/RX/AUX 引脚)
+ *    2. 配置 UART 接收中断 + DMA:
+ *       UART RX ISR → 数据写入环形缓冲区 ring_buf[2048]
+ *    3. 本函数从 ring_buf 中提取完整帧:
+ *       搜索 0xAA 0x55 帧头 → 读取 LEN → 校验 CRC8 → 返回一帧
+ *    4. 没有完整帧时返回 0
+ *
+ *  涉及的 PE2204 寄存器 (以 UART3 为参考):
+ *    UART3_BASE  = 0x2802D000  (需根据硬件确认)
+ *    GPIO 复用   = GPIO2_10 (TX), GPIO2_11 (RX)
+ *
+ *  ATK-MWCC68D LoRa模块默认参数: 9600 baud, 8N1
+ * ========================================================================== */
+static uint16_t master_lora_uart_recv(uint8_t *buf, uint16_t max_len)
+{
+    /*
+     * TODO: 真实 LoRa UART 数据接收
+     *
+     * 预期实现框架:
+     *
+     *   static uint8_t  ring_buf[2048];
+     *   static uint16_t ring_rd = 0;
+     *   static uint16_t ring_wr = 0;
+     *
+     *   uint16_t avail = (ring_wr - ring_rd) & 0x07FF;
+     *   if (avail < 7) return 0;   // 至少需要帧头(4B) + 帧尾(3B)
+     *
+     *   // 在 ring_buf 中搜索帧头 0xAA 0x55
+     *   uint16_t search = ring_rd;
+     *   while (search != ring_wr) {
+     *       if (ring_buf[search] == 0xAA
+     *           && ring_buf[(search + 1) & 0x07FF] == 0x55) break;
+     *       search = (search + 1) & 0x07FF;
+     *   }
+     *   if (search == ring_wr) { ring_rd = search; return 0; }
+     *
+     *   // 读取 LEN = data_len
+     *   // ...出帧逻辑与 inject_data 的 parse_frame 一致...
+     *
+     *   ring_rd = (search + frame_total) & 0x07FF;
+     *   memcpy(buf, &ring_buf[search], frame_total);
+     *   return frame_total;
+     */
+
     (void)buf;
     (void)max_len;
     return 0;
 }
 
-/*
- * master_recv_lora_available: 检查LoRa是否有数据可读
- * 当前为stub，返回0。
- */
-static uint16_t master_recv_lora_available(void)
+#define SIM_NODES             3
+#define SIM_SAMPLES           80        /* 总采样点数: 2周期 × 40/周期 */
+#define SIM_SAMPLES_PER_FRAME 10        /* 每帧携带10个采样点 */
+#define SIM_INIT_WAIT         30        /* 初始等待 ~300ms (30 × 10ms) */
+#define SIM_INTER_WAIT        50        /* 节点间等待 ~500ms */
+
+static uint16_t master_sim_lora_data(uint8_t *buf, uint16_t max_len)
 {
+    /* 模拟器持久状态 */
+    static uint32_t s_phase        = 0;  /* 0=initwait, 1=header, 2=samples, 3=interwait */
+    static uint32_t s_tick         = 0;
+    static uint32_t s_node         = 0;
+    static uint32_t s_sample_idx   = 0;
+
+    uint32_t timestamp;
+    uint16_t payload_len;
+    uint16_t data_len;
+    uint16_t frame_len;
+    uint16_t i;
+    uint8_t  crc;
+    uint32_t off;
+
+    s_tick++;
+
+    /* ---- Phase 0: 系统初始化等待 ---- */
+    if (s_phase == 0) {
+        if (s_tick < SIM_INIT_WAIT) return 0;
+        s_phase = 1;
+        s_tick  = 0;
+        /* fall through to phase 1 */
+    }
+
+    /* ---- Phase 1: 发送故障上报头 ---- */
+    if (s_phase == 1) {
+        FaultUploadHeader_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.data_type   = DATA_TYPE_STATUS;
+        hdr.severity    = SEVERITY_DANGER;             /* 触发判决 */
+        hdr.timestamp   = s_node * 1000;               /* 模拟时间戳 */
+        hdr.fault_type  = (s_node == 0) ? FAULT_OVER_VOLTAGE
+                        : (s_node == 1) ? FAULT_UNDER_VOLTAGE
+                        : FAULT_VOLTAGE_SWELL;          /* 3节点不同故障 */
+        hdr.node_index  = (uint8_t)s_node;
+        hdr.total_points = SIM_SAMPLES;
+        hdr.sample_rate  = NODE_SAMPLE_RATE;
+
+        payload_len = (uint16_t)sizeof(FaultUploadHeader_t);
+        data_len    = 10 + payload_len;          /* 10B frame overhead */
+        frame_len   = 4 + data_len + 3;          /* 0xAA 0x55 LEN + data + CRC + 0x55 0xAA */
+
+        if (frame_len > max_len) return 0;
+
+        off = 0;
+        buf[off++] = 0xAA;
+        buf[off++] = 0x55;
+        buf[off++] = (uint8_t)(data_len >> 8);   /* LEN_H */
+        buf[off++] = (uint8_t)(data_len);        /* LEN_L */
+
+        /* DATA section */
+        timestamp = hdr.timestamp;
+        buf[off++] = (uint8_t)(timestamp >> 24);  /* timestamp[0] */
+        buf[off++] = (uint8_t)(timestamp >> 16);  /* timestamp[1] */
+        buf[off++] = (uint8_t)(timestamp >> 8);   /* timestamp[2] */
+        buf[off++] = (uint8_t)(timestamp);        /* timestamp[3] */
+
+        buf[off++] = DATA_TYPE_STATUS;            /* frame_type */
+
+        buf[off++] = 0x00; buf[off++] = 0x00;     /* sync_code = 0 */
+        buf[off++] = 0x00; buf[off++] = 0x00;
+
+        buf[off++] = DATA_TYPE_STATUS;            /* rx_type */
+
+        memcpy(&buf[off], &hdr, payload_len);     /* payload: FaultUploadHeader_t */
+        off += payload_len;
+
+        /* CRC8: 计算 DATA 段的 CRC */
+        crc = calc_frame_crc8(&buf[4], data_len); /* buf[4] 即 DATA 起始 */
+        buf[off++] = crc;
+        buf[off++] = 0x55;
+        buf[off++] = 0xAA;
+
+        s_phase        = 2;
+        s_sample_idx   = 0;
+
+        return off;
+    }
+
+    /* ---- Phase 2: 分批发送状态采样数据 ---- */
+    if (s_phase == 2) {
+        uint16_t samples_this_frame = SIM_SAMPLES_PER_FRAME;
+        if (s_sample_idx + samples_this_frame > SIM_SAMPLES)
+            samples_this_frame = SIM_SAMPLES - s_sample_idx;
+        if (samples_this_frame == 0) {
+            s_phase = 3;
+            s_tick  = 0;
+            return 0;
+        }
+
+        payload_len = (uint16_t)(samples_this_frame * sizeof(NodeSample_t));
+        data_len    = 10 + payload_len;
+        frame_len   = 4 + data_len + 3;
+
+        if (frame_len > max_len) return 0;
+
+        off = 0;
+        buf[off++] = 0xAA;
+        buf[off++] = 0x55;
+        buf[off++] = (uint8_t)(data_len >> 8);
+        buf[off++] = (uint8_t)(data_len);
+
+        /* DATA section header */
+        timestamp = s_node * 1000 + s_sample_idx;
+        buf[off++] = (uint8_t)(timestamp >> 24);
+        buf[off++] = (uint8_t)(timestamp >> 16);
+        buf[off++] = (uint8_t)(timestamp >> 8);
+        buf[off++] = (uint8_t)(timestamp);
+
+        buf[off++] = DATA_TYPE_NODE_RAW;           /* frame_type */
+
+        buf[off++] = 0x00; buf[off++] = 0x00;      /* sync_code = 0 */
+        buf[off++] = 0x00; buf[off++] = 0x00;
+
+        buf[off++] = DATA_TYPE_NODE_RAW;           /* rx_type */
+
+        /* payload: NodeSample_t 数组 */
+        for (i = 0; i < samples_this_frame; i++) {
+            NodeSample_t samp;
+            /* 模拟真实电网数据: 在不同故障类型下构造异常值 */
+            if (s_node == 0) {
+                /* 过压: 电压偏高 */
+                samp.active_power   = 1200 + (int32_t)(s_sample_idx + i) * 3;
+                samp.reactive_power = 200 + (int32_t)(s_sample_idx + i);
+                samp.voltage_angle  = 0;
+                samp.voltage_mag    = 245000 + (int32_t)(s_sample_idx + i) * 50; /* >230V */
+            } else if (s_node == 1) {
+                /* 欠压: 电压偏低 */
+                samp.active_power   = 800 - (int32_t)(s_sample_idx + i) * 2;
+                samp.reactive_power = 150;
+                samp.voltage_angle  = 0;
+                samp.voltage_mag    = 185000 - (int32_t)(s_sample_idx + i) * 30; /* <210V */
+            } else {
+                /* 电压骤升: 先正常后骤升 */
+                samp.active_power   = 1000 + (int32_t)(s_sample_idx + i) * 2;
+                samp.reactive_power = 180;
+                samp.voltage_angle  = 0;
+                samp.voltage_mag    = (s_sample_idx + i < 40) ? 220000
+                                    : 260000 + (int32_t)(s_sample_idx + i - 40) * 100;
+            }
+            memcpy(&buf[off], &samp, sizeof(NodeSample_t));
+            off += sizeof(NodeSample_t);
+            s_sample_idx++;
+        }
+
+        /* CRC8 */
+        crc = calc_frame_crc8(&buf[4], data_len);
+        buf[off++] = crc;
+        buf[off++] = 0x55;
+        buf[off++] = 0xAA;
+
+        /* 此帧发送完毕后检查是否本轮完成 */
+        if (s_sample_idx >= SIM_SAMPLES) {
+            s_phase = 3;
+            s_tick  = 0;
+        }
+
+        return off;
+    }
+
+    /* ---- Phase 3: 节点间等待 (留给 judge 判决/命令队列处理) ---- */
+    if (s_phase == 3) {
+        if (s_tick < SIM_INTER_WAIT) return 0;
+        s_node  = (s_node + 1) % SIM_NODES;
+        s_phase = 1;
+        s_tick  = 0;
+        s_sample_idx = 0;
+        return 0;
+    }
+
     return 0;
 }
 
@@ -313,12 +554,12 @@ void master_recv_inject_data(const uint8_t *data, uint16_t len)
 /*
  * master_recv_task: 主接收任务
  *
- * 移植说明:
- *   原GD32通过 USART1 直接接收LoRa模块数据。
- *   移植后有两种数据来源:
- *     1. master_recv_lora_data() - 当LoRa模块直连FreeRTOS侧UART时使用
- *     2. master_recv_inject_data() - 当Linux侧转发LoRa数据时使用
- *   当前两种路径均为stub，后续接入LoRa模块后激活对应路径。
+ * LoRa模块直连 FreeRTOS CPU3 侧 UART。
+ * 数据路径:
+ *   master_recv_lora_data() → 仿真(g_sim) / 真实UART(uart_recv)
+ *     → master_recv_inject_data() → parse_frame() → 分发处理
+ *
+ * Linux 不参与 LoRa 数据收发，只通过 RPMsg 接收处理后的状态/命令。
  */
 void master_recv_task(void *pvParameters)
 {
@@ -327,7 +568,7 @@ void master_recv_task(void *pvParameters)
 
     (void)pvParameters;
 
-    log_info("Recv task started (stub mode)");
+    log_info("Recv task started");
 
     while (1) {
         raw_len = master_recv_lora_data(raw_buf, sizeof(raw_buf));
